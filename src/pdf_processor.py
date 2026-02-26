@@ -276,28 +276,43 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars")
       ``"pseudo_vars"``     – black box with white hex label
       ``"pseudo_natural"``  – black box with white replacement text
     All pseudonymisation modes use black + white for maximum readability.
+
+    The box is **widened** when the replacement text is longer than the
+    original so that IBANs, dates, and long names are never squeezed.
     """
     if mode == "anonymize" or not label:
         # Pure anonymization or signatures: solid black, no text
         page.add_redact_annot(rect, text="", fill=BLACK)
         return
 
-    # Calculate font size that fits the box
-    box_w = rect.width
+    # Target font size: match the height of the original box, capped at 11pt
     box_h = rect.height
     font_size = min(box_h * 0.82, 11)
-    if font_size < 4.5:
-        font_size = 4.5
+    if font_size < 5:
+        font_size = 5
 
-    # Shrink font if the label is too wide
+    # Measure how wide the label needs to be at this font size
+    padding = 4  # 2pt left + 2pt right
     text_w = fitz.get_text_length(label, fontname="helv", fontsize=font_size)
-    while text_w > box_w - 2 and font_size > 4:
-        font_size -= 0.5
-        text_w = fitz.get_text_length(label, fontname="helv", fontsize=font_size)
+    needed_w = text_w + padding
+
+    # Widen the rect if the replacement text is longer than the original box
+    page_rect = page.rect
+    final_rect = fitz.Rect(rect)
+    if needed_w > rect.width:
+        # Extend to the right, but clamp to page boundary
+        new_x1 = min(rect.x0 + needed_w, page_rect.width - 2)
+        # If extending right isn't enough, also extend left
+        actual_w = new_x1 - rect.x0
+        if actual_w < needed_w:
+            new_x0 = max(new_x1 - needed_w, 2)
+            final_rect = fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
+        else:
+            final_rect = fitz.Rect(rect.x0, rect.y0, new_x1, rect.y1)
 
     # Both pseudo modes: black box with white text for readability
     page.add_redact_annot(
-        rect,
+        final_rect,
         text=label,
         fontname="helv",
         fontsize=font_size,
