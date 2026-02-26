@@ -1,0 +1,68 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --name PDFAnonymizer --windowed --onefile --add-data "src;src" src/main.py
+
+      - name: Verify build output
+        run: |
+          dir dist\
+          dir dist\PDFAnonymizer.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDFAnonymizer-Windows
+          path: dist/PDFAnonymizer.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PDF Anonymizer ${{ github.ref_name }}"
+          body: |
+            ## PDF Anonymizer ${{ github.ref_name }}
+
+            **Download:** `PDFAnonymizer.exe` unten herunterladen und starten.
+
+            ### Voraussetzungen
+            - Windows 10/11
+            - Ein API-Key für OpenAI, Anthropic (Claude) oder Google Gemini
+            - PDFs müssen Texterkennung (OCR) enthalten
+
+            ### Erste Schritte
+            1. `PDFAnonymizer.exe` starten
+            2. Einstellungen öffnen → API-Key hinterlegen
+            3. PDF per Drag & Drop ablegen → fertig!
+
+            ### Was wird anonymisiert?
+            Vornamen, Nachnamen, Adressen, Kontonummern/IBAN, E-Mail-Adressen, Telefonnummern, Krypto-Adressen, Unternehmensnamen, Grundstücksangaben, Geburtsdaten, Steuernummern und mehr.
+          files: dist/PDFAnonymizer.exe
+          draft: false
+          prerelease: false
