@@ -128,7 +128,7 @@ def detect_entities_openai(api_key: str, text: str) -> List[Dict[str, str]]:
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(text=text)},
         ],
         temperature=0.0,
-        max_tokens=16384,
+        max_completion_tokens=16384,
     )
     return _parse_ai_response(response.choices[0].message.content)
 
