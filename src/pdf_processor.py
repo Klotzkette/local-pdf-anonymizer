@@ -406,12 +406,38 @@ def _cluster_rects(rects: List[fitz.Rect], max_gap: float = 20):
 
 # -- Individual detection methods ------------------------------------------
 
+def _image_looks_like_signature(xref: int, doc) -> bool:
+    """Heuristic: check if an image has low colour diversity (typical for
+    handwriting / stamps which are mostly one ink colour on white/transparent).
+    Returns True if the image is *likely* a signature rather than a photo.
+    """
+    try:
+        pix = fitz.Pixmap(doc, xref)
+        # Convert to grayscale for simpler analysis
+        if pix.n > 1:
+            pix = fitz.Pixmap(fitz.csGRAY, pix)
+        samples = pix.samples
+        total = len(samples)
+        if total < 10:
+            return False
+        # Count very dark and very light pixels
+        dark = sum(1 for b in samples if b < 80)
+        light = sum(1 for b in samples if b > 200)
+        # Signatures: mostly white/transparent with some dark strokes
+        ratio = (dark + light) / total
+        return ratio > 0.85  # >85% of pixels are either very dark or very light
+    except Exception:
+        return True  # If we can't analyse, assume it could be a signature
+
+
 def _redact_signature_images(page):
     """Detect and redact images that look like signatures or handwriting.
 
     Extra aggressive in the signature zone (bottom 45 % of page).
     Any small-to-medium image in the signature zone is assumed to be
     a signature, stamp, or handwritten mark.
+
+    Also uses pixel analysis to distinguish signatures from photos.
     """
     page_rect = page.rect
     sig_zone_top = page_rect.height * (1 - _SIG_ZONE_FRACTION)
@@ -420,6 +446,8 @@ def _redact_signature_images(page):
         images = page.get_images(full=True)
     except Exception:
         return
+
+    doc = page.parent
 
     for img_info in images:
         xref = img_info[0]
@@ -432,17 +460,23 @@ def _redact_signature_images(page):
             area = w * h
             in_sig_zone = rect.y0 >= sig_zone_top
 
-            # General signature detection (anywhere on page)
-            if 20 < w < 500 and 6 < h < 180 and 300 < area < 80_000:
-                expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN)
-                page.add_redact_annot(expanded, text="", fill=BLACK)
+            # Skip very large images (full-page scans, photos)
+            if w > page_rect.width * 0.8 and h > page_rect.height * 0.5:
                 continue
+
+            # General signature detection (anywhere on page)
+            # Expanded range to catch more signature sizes
+            if 15 < w < 600 and 5 < h < 250 and 150 < area < 120_000:
+                if _image_looks_like_signature(xref, doc):
+                    expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN + 3)
+                    page.add_redact_annot(expanded, text="", fill=BLACK)
+                    continue
 
             # In signature zone: very wide tolerance – catch scribbles,
             # stamps, initials, paraphs, etc.
-            if in_sig_zone and w > 15 and h > 5 and area > 200:
-                if w < page_rect.width * 0.7 and h < page_rect.height * 0.20:
-                    expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN)
+            if in_sig_zone and w > 10 and h > 4 and area > 100:
+                if w < page_rect.width * 0.75 and h < page_rect.height * 0.25:
+                    expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN + 3)
                     page.add_redact_annot(expanded, text="", fill=BLACK)
 
 
@@ -559,8 +593,8 @@ def _redact_bottom_zone_scan(page):
     except Exception:
         pass
 
-    # Render at low resolution (48 DPI) for speed
-    scale = 48.0 / 72.0
+    # Render at moderate resolution (72 DPI) – better detection than 48 DPI
+    scale = 72.0 / 72.0
     mat = fitz.Matrix(scale, scale)
     clip = fitz.Rect(page_rect.x0, sig_zone_top, page_rect.x1, page_rect.y1)
 
@@ -575,9 +609,9 @@ def _redact_bottom_zone_scan(page):
 
     samples = pix.samples  # grayscale bytes (one byte per pixel)
 
-    # Divide the rendered zone into a grid of cells (~30 px each)
-    n_cols = max(1, pw // 30)
-    n_rows = max(1, ph // 30)
+    # Divide the rendered zone into a grid of cells (~20 px each for finer detection)
+    n_cols = max(1, pw // 20)
+    n_rows = max(1, ph // 20)
     cell_w = pw / n_cols
     cell_h = ph / n_rows
 
@@ -611,8 +645,8 @@ def _redact_bottom_zone_scan(page):
                         dark += 1
                     total += 1
 
-            # Flag cells where > 3 % of pixels are dark (non-text marks)
-            if total > 0 and dark / total > 0.03:
+            # Flag cells where > 2 % of pixels are dark (non-text marks)
+            if total > 0 and dark / total > 0.02:
                 suspect_cells.append(cell_page_rect)
 
     if not suspect_cells:
@@ -816,17 +850,21 @@ def _detect_and_redact_signatures(page):
 # GPT-5.2 Vision-based signature detection  (catch-all for missed handwriting)
 # ---------------------------------------------------------------------------
 
-_VISION_SIG_PROMPT = """Analysiere dieses Dokumentbild SEHR GENAU auf Unterschriften, Handschrift, Paraphen, Initialen, handschriftliche Kringel und Stempel.
+_VISION_SIG_PROMPT = """Analysiere dieses Dokumentbild PIXEL FÜR PIXEL auf handschriftliche Elemente.
 
-Suche BESONDERS:
-- Handschriftliche Unterschriften (Signaturen) überall auf der Seite, besonders im unteren Bereich
-- Handschriftlich geschriebene Wörter oder Buchstaben
-- Paraphen, Initialen, Kürzel
-- Stempel (rund, oval, rechteckig)
-- Handschriftliche Anmerkungen, Notizen, Randbemerkungen
-- Jegliche Kringel, Schnörkel oder handschriftliche Markierungen
+DU MUSST FINDEN:
+1. UNTERSCHRIFTEN – handschriftliche Signaturen, Namenszüge, Autogramme. Überall auf der Seite, aber besonders unten. Auch wenn sie sehr klein, blass oder teilweise verdeckt sind.
+2. PARAPHEN & INITIALEN – kurze handschriftliche Kürzel, einzelne Buchstaben mit Schnörkeln, Abzeichnungen.
+3. HANDSCHRIFT – jedes handgeschriebene Wort, jede handgeschriebene Zahl, jeden handgeschriebenen Buchstaben. Auch einzelne Zeichen.
+4. STEMPEL – runde, ovale, rechteckige Stempel mit Text oder Symbolen.
+5. GRAFISCHE SIGNATUREN – eingescannte Unterschriften als Bilder, die wie Handschrift aussehen. Achte besonders auf Bilder die Tintenstriche zeigen.
+6. KRINGEL & SCHNÖRKEL – jede Art von handschriftlicher Markierung, Unterstreichung, Durchstreichung, Kreise um Text.
 
-Für JEDE gefundene handschriftliche Stelle, gib die UNGEFÄHRE Position als Bounding-Box in Prozent der Seitenbreite/-höhe an.
+WICHTIG: Lieber 5× zu viel melden als 1× eine Unterschrift übersehen!
+Achte besonders auf blasse, kleine oder im Hintergrund liegende handschriftliche Elemente.
+
+Für JEDE Stelle gib die Position als Bounding-Box in Prozent der Seitenbreite/-höhe an.
+Mache die Boxen GROSSZÜGIG – lieber etwas zu groß als zu klein.
 
 Antworte NUR mit JSON:
 {
@@ -836,8 +874,7 @@ Antworte NUR mit JSON:
   ]
 }
 
-Wenn KEINE Handschrift gefunden wird: {"signatures": []}
-Sei lieber zu gründlich als zu vorsichtig – im Zweifel IMMER melden."""
+Wenn KEINE Handschrift gefunden wird: {"signatures": []}"""
 
 
 def _detect_signatures_with_vision(page, api_key: str) -> List[fitz.Rect]:
@@ -851,8 +888,8 @@ def _detect_signatures_with_vision(page, api_key: str) -> List[fitz.Rect]:
 
     page_rect = page.rect
 
-    # Render page at 150 DPI (good balance of quality and size)
-    scale = 150.0 / 72.0
+    # Render page at 200 DPI for better handwriting detail detection
+    scale = 200.0 / 72.0
     mat = fitz.Matrix(scale, scale)
     try:
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
@@ -955,11 +992,20 @@ def redact_pdf(
         for entity_text in sorted_entities:
             label, _category = entity_map[entity_text]
 
-            # Search for all occurrences on this page
-            text_instances = page.search_for(entity_text)
+            # Use quads=True for pixel-precise text location, then
+            # convert each quad to its enclosing rect with a small
+            # vertical pad so the black box fully covers the glyphs.
+            try:
+                quads = page.search_for(entity_text, quads=True)
+            except Exception:
+                quads = page.search_for(entity_text)
 
-            for inst in text_instances:
-                _add_redaction(page, inst, label, mode)
+            for q in quads:
+                r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
+                # Tiny vertical padding (1.5pt) so descenders/ascenders
+                # never peek out of the black box.
+                r = fitz.Rect(r.x0, r.y0 - 1.5, r.x1, r.y1 + 1.5)
+                _add_redaction(page, r, label, mode)
 
         # Redact logos / brand images / letterheads in headers and footers
         logo_count += _redact_logo_images(page, repeating_xrefs, mode)
@@ -974,7 +1020,8 @@ def redact_pdf(
         if api_key:
             vision_rects = _detect_signatures_with_vision(page, api_key)
             for rect in vision_rects:
-                expanded = _expand_rect(rect, page.rect, _REDACT_MARGIN)
+                # Generous margin (10pt) around vision-detected handwriting
+                expanded = _expand_rect(rect, page.rect, _REDACT_MARGIN + 5)
                 page.add_redact_annot(expanded, text="", fill=BLACK)
 
         # Apply all redactions for this page at once (removes underlying text)

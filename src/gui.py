@@ -133,7 +133,11 @@ def save_mode(mode: str):
 
 def load_mode() -> str:
     s = _settings()
-    return s.value("processing_mode", MODE_PSEUDO_VARS)
+    val = s.value("processing_mode", MODE_ANONYMIZE)
+    # Migrate removed mode to default
+    if val == MODE_PSEUDO_VARS:
+        return MODE_ANONYMIZE
+    return val
 
 
 def save_scope(scope: str):
@@ -640,7 +644,7 @@ class AnonymizeWorker(QThread):
         output_path: str,
         provider: str,
         api_key: str,
-        mode: str = MODE_PSEUDO_VARS,
+        mode: str = MODE_ANONYMIZE,
         scope: str = SCOPE_ALL,
     ):
         super().__init__()
@@ -850,27 +854,23 @@ class SettingsDialog(QDialog):
 _MODE_OPTIONS = [
     (
         MODE_ANONYMIZE,
-        "Anonymisieren  (nur Schwärzen)",
-        "Alle erkannten personenbezogenen Daten werden\n"
-        "komplett geschwärzt – keine Variablen, keine Ersetzungen.",
-    ),
-    (
-        MODE_PSEUDO_VARS,
-        "Pseudonymisieren  (Variablen)",
-        "Erkannte Daten werden durch hexadezimale\n"
-        "Variablen ersetzt (A, B, C, D, …).",
+        "Schwärzen",
+        "Alle erkannten Daten werden komplett\n"
+        "geschwärzt – nichts bleibt lesbar.",
     ),
     (
         MODE_PSEUDO_NATURAL,
-        "Pseudonymisieren  (Natürlich)",
-        "KI generiert natürlich klingende Ersatznamen,\n"
-        "Adressen, Nummern etc.",
+        "Pseudonymisieren",
+        "KI ersetzt Namen, Adressen, Nummern etc.\n"
+        "durch natürlich klingende Alternativen.",
     ),
 ]
 
 _SCOPE_OPTIONS = [
-    (SCOPE_NAMES_ONLY, "Personen-Daten", "Namen, Adressen, Städte, E-Mail, Telefon"),
-    (SCOPE_ALL, "Alles + Zahlen", "Zusätzlich Beträge, Summen, Prozente, IBANs"),
+    (SCOPE_NAMES_ONLY, "Personenbezogene Daten",
+     "Namen, Adressen, Städte, E-Mail, Telefon\nund weitere personen-identifizierende Infos"),
+    (SCOPE_ALL, "Zusätzlich Nummern & Beträge",
+     "Wie oben, plus Geldbeträge, Summen,\nProzente, IBANs, Aktenzeichen etc."),
 ]
 
 
@@ -1061,7 +1061,7 @@ class MainWindow(QMainWindow):
         self.current_pdf: str | None = None
         self._last_output: str | None = None
         self._entity_count = 0
-        self._selected_mode: str = MODE_PSEUDO_VARS
+        self._selected_mode: str = MODE_ANONYMIZE
 
         # Central widget
         central = QWidget()
@@ -1221,13 +1221,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Geladen: {name}")
         self.start_anonymization()
 
-    @staticmethod
-    def _anonymized_filename(mode: str) -> str:
-        """Generate an anonymized output filename with date prefix."""
+    # Class-level counter so each file in a session gets a unique number
+    _file_counter = 0
+
+    @classmethod
+    def _anonymized_filename(cls, mode: str) -> str:
+        """Generate an output filename: date + suffix + running number."""
         from datetime import date
+        cls._file_counter += 1
         today = date.today().strftime("%Y%m%d")
-        suffix = "Anonymisiert" if mode == MODE_ANONYMIZE else "Pseudonymisiert"
-        return f"{today}_Dokument_{suffix}.pdf"
+        suffix = "Geschwärzt" if mode == MODE_ANONYMIZE else "Pseudonymisiert"
+        return f"{today}_Dokument_{suffix}_{cls._file_counter:03d}.pdf"
 
     def start_anonymization(self):
         if not self.current_pdf:
