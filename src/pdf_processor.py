@@ -457,56 +457,66 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars")
       ``"anonymize"``       – solid black box, no text
       ``"pseudo_vars"``     – black box with white hex label
       ``"pseudo_natural"``  – black box with white replacement text
-    All pseudonymisation modes use black + white for maximum readability.
 
-    The box is **widened** when the replacement text is longer than the
-    original so that IBANs, dates, and long names are never squeezed.
+    READABILITY FIRST – the box is kept as tight as possible to the
+    original text.  When the label text is longer than the original we
+    **shrink the font** (and truncate with "…" as last resort) instead
+    of widening the rectangle, so neighbouring text is never covered.
 
-    Returns ``(final_rect, label, font_size)`` so the caller can draw
-    a visual overlay after ``apply_redactions()`` (belt-and-suspenders
-    to ensure the black fill is always visible).
+    Returns ``(final_rect, label, font_size)`` for the overlay pass.
     """
     if mode == "anonymize" or not label:
-        # Pure anonymization or signatures: solid black, no text
         page.add_redact_annot(rect, text="", fill=BLACK)
         return (fitz.Rect(rect), "", 0)
 
-    # Target font size: match the height of the original box, capped at 11pt
+    # Target font size: match the height of the box, capped
     box_h = rect.height
-    font_size = min(box_h * 0.82, 11)
-    if font_size < 5:
-        font_size = 5
+    font_size = min(box_h * 0.78, 11)
+    if font_size < 4:
+        font_size = 4
 
-    # Measure how wide the label needs to be at this font size
+    # Maximum width: original text rect + a tiny allowance (6pt).
+    # NEVER widen significantly – that would cover adjacent text.
+    max_w = rect.width + 6
     padding = 4  # 2pt left + 2pt right
-    text_w = fitz.get_text_length(label, fontname="helv", fontsize=font_size)
-    needed_w = text_w + padding
 
-    # Widen the rect if the replacement text is longer than the original box
-    page_rect = page.rect
+    text_w = fitz.get_text_length(label, fontname="helv", fontsize=font_size)
+
+    # Strategy 1: shrink font until it fits
+    while text_w + padding > max_w and font_size > 4:
+        font_size -= 0.5
+        text_w = fitz.get_text_length(label, fontname="helv", fontsize=font_size)
+
+    # Strategy 2: if still too wide, truncate with "…"
+    display_label = label
+    if text_w + padding > max_w and len(label) > 4:
+        while (len(display_label) > 2
+               and fitz.get_text_length(display_label + "…", fontname="helv",
+                                        fontsize=font_size) + padding > max_w):
+            display_label = display_label[:-1]
+        display_label = display_label + "…"
+
+    needed_w = fitz.get_text_length(display_label, fontname="helv",
+                                    fontsize=font_size) + padding
+
+    # Only extend by the absolute minimum, never more than 6pt extra
     final_rect = fitz.Rect(rect)
     if needed_w > rect.width:
-        # Extend to the right, but clamp to page boundary
-        new_x1 = min(rect.x0 + needed_w, page_rect.width - 2)
-        # If extending right isn't enough, also extend left
-        actual_w = new_x1 - rect.x0
-        if actual_w < needed_w:
-            new_x0 = max(new_x1 - needed_w, 2)
-            final_rect = fitz.Rect(new_x0, rect.y0, new_x1, rect.y1)
-        else:
-            final_rect = fitz.Rect(rect.x0, rect.y0, new_x1, rect.y1)
+        extra = min(needed_w - rect.width, 6)
+        page_rect = page.rect
+        new_x1 = min(rect.x0 + rect.width + extra, page_rect.width - 2)
+        final_rect = fitz.Rect(rect.x0, rect.y0, new_x1, rect.y1)
 
-    # Both pseudo modes: black box with white text for readability
     page.add_redact_annot(
         final_rect,
-        text=label,
+        text=display_label,
         fontname="helv",
         fontsize=font_size,
         align=fitz.TEXT_ALIGN_CENTER,
         fill=BLACK,
         text_color=WHITE,
     )
-    return (fitz.Rect(final_rect), label, font_size)
+    return (fitz.Rect(final_rect), display_label, font_size)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +534,8 @@ _CLUSTER_GAP = 14
 _MIN_CLUSTER_STROKES = 3
 
 # Extra padding (pt) around every detected signature element.
-_REDACT_MARGIN = 5
+# Keep small to avoid covering adjacent text.
+_REDACT_MARGIN = 2
 
 
 def _expand_rect(rect: fitz.Rect, page_rect: fitz.Rect, margin: float = 15) -> fitz.Rect:
@@ -535,6 +546,48 @@ def _expand_rect(rect: fitz.Rect, page_rect: fitz.Rect, margin: float = 15) -> f
         min(page_rect.x1, rect.x1 + margin),
         min(page_rect.y1, rect.y1 + margin),
     )
+
+
+def _safe_expand_rect(rect: fitz.Rect, page, margin: float = 2) -> fitz.Rect:
+    """Expand *rect* by *margin* but shrink back if it would overlap text
+    blocks that lie OUTSIDE the original rect.
+
+    This guarantees that redaction boxes never obscure adjacent readable
+    text – the single most important rule for output readability.
+    """
+    page_rect = page.rect
+    expanded = _expand_rect(rect, page_rect, margin)
+
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:
+        return expanded
+
+    for block in blocks:
+        br = fitz.Rect(block[:4])
+        if br.is_empty or not expanded.intersects(br):
+            continue
+        # Text block already inside the original rect → target text, OK
+        if rect.contains(br):
+            continue
+        # Block partially overlaps the expansion – clamp each edge
+        if br.x1 > rect.x0 and br.x0 < rect.x0 and expanded.x0 < br.x1:
+            expanded = fitz.Rect(max(expanded.x0, br.x1 + 0.5),
+                                 expanded.y0, expanded.x1, expanded.y1)
+        if br.x0 < rect.x1 and br.x1 > rect.x1 and expanded.x1 > br.x0:
+            expanded = fitz.Rect(expanded.x0, expanded.y0,
+                                 min(expanded.x1, br.x0 - 0.5), expanded.y1)
+        if br.y1 > rect.y0 and br.y0 < rect.y0 and expanded.y0 < br.y1:
+            expanded = fitz.Rect(expanded.x0, max(expanded.y0, br.y1 + 0.5),
+                                 expanded.x1, expanded.y1)
+        if br.y0 < rect.y1 and br.y1 > rect.y1 and expanded.y1 > br.y0:
+            expanded = fitz.Rect(expanded.x0, expanded.y0,
+                                 expanded.x1, min(expanded.y1, br.y0 - 0.5))
+
+    # If clamping collapsed the rect, fall back to original
+    if expanded.is_empty or expanded.width < 2 or expanded.height < 2:
+        return fitz.Rect(rect)
+    return expanded
 
 
 def _cluster_rects(rects: List[fitz.Rect], max_gap: float = 20):
@@ -653,18 +706,18 @@ def _redact_signature_images(page):
 
             # General signature detection (anywhere on page)
             # Expanded range to catch more signature sizes
-            if 15 < w < 600 and 5 < h < 250 and 150 < area < 120_000:
+            if 15 < w < 400 and 5 < h < 150 and 200 < area < 80_000:
                 if _image_looks_like_signature(xref, doc):
-                    expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN + 3)
+                    expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN)
                     page.add_redact_annot(expanded, text="", fill=BLACK)
                     continue
 
-            # In signature zone: very wide tolerance – catch scribbles,
-            # stamps, initials, paraphs, etc.
-            if in_sig_zone and w > 10 and h > 4 and area > 100:
-                if w < page_rect.width * 0.75 and h < page_rect.height * 0.25:
-                    expanded = _expand_rect(rect, page_rect, _REDACT_MARGIN + 3)
-                    page.add_redact_annot(expanded, text="", fill=BLACK)
+            # In signature zone: moderate tolerance for scribbles / stamps
+            if in_sig_zone and w > 15 and h > 6 and area > 200:
+                if w < page_rect.width * 0.5 and h < page_rect.height * 0.15:
+                    if _image_looks_like_signature(xref, doc):
+                        expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN)
+                        page.add_redact_annot(expanded, text="", fill=BLACK)
 
 
 def _redact_signature_drawings(page):
@@ -720,7 +773,7 @@ def _redact_signature_drawings(page):
         if cluster_rect.width > page_rect.width * 0.5 and cluster_rect.height > 120:
             continue
 
-        expanded = _expand_rect(cluster_rect, page_rect, _REDACT_MARGIN)
+        expanded = _safe_expand_rect(cluster_rect, page, _REDACT_MARGIN)
         page.add_redact_annot(expanded, text="", fill=BLACK)
 
 
@@ -735,7 +788,7 @@ def _redact_ink_annotations(page):
         try:
             # PDF annotation type 19 = Ink (freehand drawing)
             if annot.type[0] == 19:
-                expanded = _expand_rect(annot.rect, page.rect, _REDACT_MARGIN)
+                expanded = _safe_expand_rect(fitz.Rect(annot.rect), page, _REDACT_MARGIN)
                 page.add_redact_annot(expanded, text="", fill=BLACK)
             annot = annot.next
         except Exception:
@@ -753,7 +806,7 @@ def _redact_form_signature_fields(page):
         try:
             # field_type 7 = signature field in PyMuPDF
             if widget.field_type == 7:
-                expanded = _expand_rect(widget.rect, page.rect, _REDACT_MARGIN)
+                expanded = _safe_expand_rect(fitz.Rect(widget.rect), page, _REDACT_MARGIN)
                 page.add_redact_annot(expanded, text="", fill=BLACK)
             widget = widget.next
         except Exception:
@@ -843,7 +896,7 @@ def _redact_bottom_zone_scan(page):
     clusters = _cluster_rects(suspect_cells, max_gap=12)
     for merged_rect, count in clusters:
         if count >= 3:
-            expanded = _expand_rect(merged_rect, page.rect, _REDACT_MARGIN)
+            expanded = _safe_expand_rect(merged_rect, page, _REDACT_MARGIN)
             page.add_redact_annot(expanded, text="", fill=BLACK)
 
 
@@ -1231,9 +1284,9 @@ def redact_pdf(
 
             for q in quads:
                 r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
-                # Tiny vertical padding (1.5pt) so descenders/ascenders
-                # never peek out of the black box.
-                r = fitz.Rect(r.x0, r.y0 - 1.5, r.x1, r.y1 + 1.5)
+                # Minimal vertical padding so the box covers the glyphs
+                # tightly without spilling into neighbouring lines.
+                r = fitz.Rect(r.x0, r.y0 - 0.8, r.x1, r.y1 + 0.8)
                 info = _add_redaction(page, r, label, mode)
                 page_overlays.append(info)
 
@@ -1250,8 +1303,8 @@ def redact_pdf(
         if api_key:
             vision_rects = _detect_signatures_with_vision(page, api_key)
             for rect in vision_rects:
-                # Generous margin (10pt) around vision-detected handwriting
-                expanded = _expand_rect(rect, page.rect, _REDACT_MARGIN + 5)
+                # Tight margin around vision-detected handwriting
+                expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN + 1)
                 page.add_redact_annot(expanded, text="", fill=BLACK)
 
         # Collect non-entity redaction rects (signatures, logos) from
