@@ -1419,6 +1419,38 @@ def _expand_entity_map(entity_map: Dict[str, Tuple[str, str]]):
 
     entity_map.update(additions)
 
+    # ── Case variants (UPPER / lower) ──
+    # Documents often use ALL-CAPS headings: "SPARKASSE" vs "Sparkasse".
+    case_adds: Dict[str, Tuple[str, str]] = {}
+    for text, (label, cat) in list(entity_map.items()):
+        if len(text) < 3 or _is_legal_numbering(text):
+            continue
+        for variant in (text.upper(), text.lower()):
+            if variant != text and variant not in entity_map and variant not in case_adds:
+                case_adds[variant] = (label, cat)
+    entity_map.update(case_adds)
+
+    # ── Spaced / "gesperrt" variants ──
+    # Some documents letter-space names: "S P A R K A S S E" or "M ü l l e r".
+    # Generate spaced forms for every single-word entity >= 4 chars.
+    spaced_adds: Dict[str, Tuple[str, str]] = {}
+    for text, (label, cat) in list(entity_map.items()):
+        words = text.split()
+        if len(words) != 1:
+            continue
+        word = words[0]
+        if len(word) < 4 or _is_legal_numbering(word):
+            continue
+        # "Sparkasse" → "S p a r k a s s e"
+        spaced = " ".join(word)
+        if spaced not in entity_map and spaced not in spaced_adds:
+            spaced_adds[spaced] = (label, cat)
+        # Also the uppercase spaced form: "S P A R K A S S E"
+        spaced_up = " ".join(word.upper())
+        if spaced_up not in entity_map and spaced_up != spaced and spaced_up not in spaced_adds:
+            spaced_adds[spaced_up] = (label, cat)
+    entity_map.update(spaced_adds)
+
 
 def redact_pdf(
     pdf_path: str,
