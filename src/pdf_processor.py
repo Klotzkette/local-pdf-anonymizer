@@ -464,6 +464,44 @@ def prepare_input(
     return _do_ocr(input_path, api_key, status_callback)
 
 
+# ---------------------------------------------------------------------------
+# Scan page detection
+# ---------------------------------------------------------------------------
+
+def _page_is_scan(page) -> bool:
+    """Detect if *page* is a scanned image (full-page background image).
+
+    On scan pages, the entire visible content is ONE large raster image
+    with an invisible OCR text layer on top.  ``apply_redactions`` with
+    ``PDF_REDACT_IMAGE_REMOVE`` would delete that image and wipe the
+    whole page.  We need ``PDF_REDACT_IMAGE_PIXELS`` instead.
+    """
+    try:
+        images = page.get_images(full=True)
+    except Exception:
+        return False
+    if not images:
+        return False
+
+    page_rect = page.rect
+    page_area = page_rect.width * page_rect.height
+    if page_area < 1:
+        return False
+
+    for img_info in images:
+        xref = img_info[0]
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:
+            continue
+        for rect in rects:
+            img_area = rect.width * rect.height
+            # Image covers > 50 % of page → almost certainly a scan
+            if img_area > page_area * 0.50:
+                return True
+    return False
+
+
 def extract_text(pdf_path: str) -> str:
     """Extract the full plain text from a PDF. Requires the PDF to have embedded text."""
     doc = fitz.open(pdf_path)
@@ -492,8 +530,8 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars",
     Returns ``(final_rect, label, font_size, category)`` for the overlay.
     """
     if mode == "anonymize" or not label:
-        # fill=None → annotation only removes content; overlay handles visuals
-        page.add_redact_annot(rect, text="", fill=None)
+        # fill=REDACT_BG → annotation only removes content; overlay handles visuals
+        page.add_redact_annot(rect, text="", fill=REDACT_BG)
         return (fitz.Rect(rect), "", 0, category)
 
     # Target font size: slightly smaller than box height for breathing room
@@ -535,11 +573,11 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars",
         new_x1 = min(rect.x0 + rect.width + extra, page_rect.width - 2)
         final_rect = fitz.Rect(rect.x0, rect.y0, new_x1, rect.y1)
 
-    # fill=None → annotation only removes content; overlay handles visuals
+    # fill=REDACT_BG → annotation only removes content; overlay handles visuals
     page.add_redact_annot(
         final_rect,
         text="",
-        fill=None,
+        fill=REDACT_BG,
     )
     return (fitz.Rect(final_rect), display_label, font_size, category)
 
@@ -734,7 +772,7 @@ def _redact_signature_images(page):
             if 15 < w < 400 and 5 < h < 150 and 200 < area < 80_000:
                 if _image_looks_like_signature(xref, doc):
                     expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN)
-                    page.add_redact_annot(expanded, text="", fill=None)
+                    page.add_redact_annot(expanded, text="", fill=REDACT_BG)
                     continue
 
             # In signature zone: moderate tolerance for scribbles / stamps
@@ -742,7 +780,7 @@ def _redact_signature_images(page):
                 if w < page_rect.width * 0.5 and h < page_rect.height * 0.15:
                     if _image_looks_like_signature(xref, doc):
                         expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN)
-                        page.add_redact_annot(expanded, text="", fill=None)
+                        page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
 
 def _redact_signature_drawings(page):
@@ -800,7 +838,7 @@ def _redact_signature_drawings(page):
             continue
 
         expanded = _safe_expand_rect(cluster_rect, page, _REDACT_MARGIN)
-        page.add_redact_annot(expanded, text="", fill=None)
+        page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
 
 def _redact_ink_annotations(page):
@@ -815,7 +853,7 @@ def _redact_ink_annotations(page):
             # PDF annotation type 19 = Ink (freehand drawing)
             if annot.type[0] == 19:
                 expanded = _safe_expand_rect(fitz.Rect(annot.rect), page, _REDACT_MARGIN)
-                page.add_redact_annot(expanded, text="", fill=None)
+                page.add_redact_annot(expanded, text="", fill=REDACT_BG)
             annot = annot.next
         except Exception:
             break
@@ -833,7 +871,7 @@ def _redact_form_signature_fields(page):
             # field_type 7 = signature field in PyMuPDF
             if widget.field_type == 7:
                 expanded = _safe_expand_rect(fitz.Rect(widget.rect), page, _REDACT_MARGIN)
-                page.add_redact_annot(expanded, text="", fill=None)
+                page.add_redact_annot(expanded, text="", fill=REDACT_BG)
             widget = widget.next
         except Exception:
             break
@@ -925,7 +963,7 @@ def _redact_bottom_zone_scan(page):
     for merged_rect, count in clusters:
         if count >= 5:
             expanded = _safe_expand_rect(merged_rect, page, _REDACT_MARGIN)
-            page.add_redact_annot(expanded, text="", fill=None)
+            page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
 
 # ---------------------------------------------------------------------------
@@ -1018,8 +1056,8 @@ def _redact_logo_images(page, repeating_xrefs: set, mode: str) -> int:
             if should_redact:
                 expanded = _expand_rect(rect, page_rect, 2)
                 # Subtle fill, no "LOGO" text – keeps output clean and subtle.
-                # fill=None: annotation removes content, overlay handles visuals.
-                page.add_redact_annot(expanded, text="", fill=None)
+                # fill=REDACT_BG: annotation removes content, overlay handles visuals.
+                page.add_redact_annot(expanded, text="", fill=REDACT_BG)
                 count += 1
 
     return count
@@ -1064,7 +1102,7 @@ def _redact_header_zone_drawings(page):
     for cluster_rect, stroke_count in clusters:
         if stroke_count >= 2:
             expanded = _expand_rect(cluster_rect, page_rect, 2)
-            page.add_redact_annot(expanded, text="", fill=None)
+            page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
 
 # ---------------------------------------------------------------------------
@@ -1094,18 +1132,22 @@ def _strip_metadata(doc):
 
 # -- Orchestrator -----------------------------------------------------------
 
-def _detect_and_redact_signatures(page):
-    """Run all signature / handwriting detection methods on *page*.
+def _detect_and_redact_signatures(page, is_scan: bool = False):
+    """Run signature / handwriting detection methods on *page*.
 
-    Combines five detection strategies for maximum coverage:
-    image analysis, vector clustering, ink annotations, form fields,
-    and a render-based bottom-zone scan as catch-all.
+    On scan pages, image analysis, vector clustering, and the render-based
+    bottom-zone scan are SKIPPED because they would analyse the scan
+    image itself and produce massive false positives.  Only ink
+    annotations, form fields, and (externally) vision-based detection
+    are used for scans.
     """
-    _redact_signature_images(page)
-    _redact_signature_drawings(page)
+    if not is_scan:
+        _redact_signature_images(page)
+        _redact_signature_drawings(page)
     _redact_ink_annotations(page)
     _redact_form_signature_fields(page)
-    _redact_bottom_zone_scan(page)
+    if not is_scan:
+        _redact_bottom_zone_scan(page)
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1269,7 @@ def _detect_signatures_with_vision(page, api_key: str) -> List[fitz.Rect]:
 def _draw_redaction_overlays(page, overlays: list, entity_map=None):
     """Draw elegant redaction boxes over areas where content was removed.
 
-    This is the ONLY visual rendering step – annotations use ``fill=None``
+    This is the ONLY visual rendering step – annotations use ``fill=REDACT_BG``
     so they only delete content.  All visual fill and label drawing happens
     here, guaranteeing consistent appearance on every PDF type.
 
@@ -1370,14 +1412,19 @@ def redact_pdf(
                 info = _add_redaction(page, r, label, mode, category=category)
                 page_overlays.append(info)
 
-        # Redact logos / brand images / letterheads in headers and footers
-        logo_count += _redact_logo_images(page, repeating_xrefs, mode)
+        # Detect if this page is a scan (full-page background image).
+        # On scans, image/vector-based detection would analyse the scan
+        # itself and cause massive false positives → skip those methods.
+        page_is_scan = _page_is_scan(page)
 
-        # Redact vector drawings in header zone (letterhead graphics)
-        _redact_header_zone_drawings(page)
+        if not page_is_scan:
+            # Redact logos / brand images / letterheads in headers/footers
+            logo_count += _redact_logo_images(page, repeating_xrefs, mode)
+            # Redact vector drawings in header zone (letterhead graphics)
+            _redact_header_zone_drawings(page)
 
         # Redact signatures, handwriting, ink annotations, etc.
-        _detect_and_redact_signatures(page)
+        _detect_and_redact_signatures(page, is_scan=page_is_scan)
 
         # GPT-5.2 vision-based signature detection (catch-all)
         if api_key:
@@ -1385,7 +1432,7 @@ def redact_pdf(
             for rect in vision_rects:
                 # Tight margin around vision-detected handwriting
                 expanded = _safe_expand_rect(rect, page, _REDACT_MARGIN)
-                page.add_redact_annot(expanded, text="", fill=None)
+                page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
         # Collect non-entity redaction rects (signatures, logos) from
         # annotations so we can re-draw them as overlays too.
@@ -1406,8 +1453,15 @@ def redact_pdf(
             except Exception:
                 break
 
-        # Apply all redactions for this page at once (removes underlying text)
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+        # Apply all redactions for this page at once.
+        # CRITICAL: On scan pages the entire visible content is one big
+        # raster image.  PDF_REDACT_IMAGE_REMOVE would delete it and
+        # wipe the whole page.  PDF_REDACT_IMAGE_PIXELS instead blanks
+        # only the pixels under each annotation → scan stays intact.
+        if page_is_scan:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+        else:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
 
         # Re-draw every redacted area as an elegant filled overlay
         _draw_redaction_overlays(page, page_overlays, entity_map=entity_map)
