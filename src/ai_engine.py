@@ -47,16 +47,16 @@ CHUNK_OVERLAP = 2_000
 # Prompt that instructs the AI to find all PII entities
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """Du bist ein äußerst gründlicher Experte für Datenanonymisierung. Deine Aufgabe ist es, in einem gegebenen Text ALLE personenbezogenen und identifizierenden Daten LÜCKENLOS zu finden.
+SYSTEM_PROMPT = """Du bist ein präziser Experte für Datenanonymisierung. Deine Aufgabe ist es, in einem gegebenen Text ALLE personenbezogenen und identifizierenden Daten LÜCKENLOS zu finden.
 
-OBERSTE REGEL: LIEBER ZU VIEL SCHWÄRZEN ALS ZU WENIG. Im Zweifel IMMER als Entität markieren. Es ist viel schlimmer, einen Namen oder eine persönliche Information zu ÜBERSEHEN, als einmal zu viel zu schwärzen.
+OBERSTE REGEL: Finde ALLE echten personenbezogenen Daten – aber nur ECHTE PII. Lieber einmal zu viel als zu wenig, ABER: Dokumentstruktur (Nummerierungen, Paragraphen, Gliederungen) darf NIEMALS als PII gemeldet werden. Das Dokument muss nach der Schwärzung noch lesbar und strukturell intakt sein.
 
 Du musst folgende Kategorien erkennen – in ALLEN Sprachen, die im Text vorkommen:
 
 1. VORNAME – Vornamen von Personen. Auch: Spitznamen, Rufnamen, abgekürzte Vornamen (z.B. "Max", "M.", "Hans-Peter", "J.", "Dr. Hans"). JEDER Vorname muss erkannt werden, egal ob er am Satzanfang, in einer Aufzählung, in einer Grußformel, in einer Unterschrift, in einem Briefkopf, in einer E-Mail-Signatur oder irgendwo anders steht. Auch einzelne Buchstaben mit Punkt (z.B. "M."), die als Vornamens-Abkürzung verwendet werden.
 2. NACHNAME – Nachnamen von Personen. Auch: Doppelnamen (z.B. "Müller-Schmidt"), Namenszusätze (z.B. "von", "van", "de", "zu" als Teil des Namens), Titel+Name-Kombinationen. JEDER Nachname muss erkannt werden, auch wenn er nur einmal vorkommt. Nachnamen in Firmennamen (z.B. "Müller" in "Kanzlei Müller") EBENFALLS erkennen.
 3. STRASSE – Straßennamen (z.B. "Hauptstraße", "Bahnhofstr.", "Am Markt", "Rue de la Paix")
-4. HAUSNUMMER – Hausnummern (z.B. "42", "12a", "7-9")
+4. HAUSNUMMER – Hausnummern NUR im Kontext einer Adresse (z.B. "42" in "Hauptstraße 42", "12a"). Einzelne Zahlen ohne Adresskontext sind KEINE Hausnummern!
 5. STADT – Städte / Orte (z.B. "Berlin", "Wien", "München", "Graz"). Auch kleinere Orte und Gemeinden.
 6. PLZ – Postleitzahlen (z.B. "10115", "A-1010", "8010")
 7. LAND – Länder (z.B. "Deutschland", "Österreich", "Germany")
@@ -136,9 +136,9 @@ Antworte NUR mit dem JSON-Objekt. Jeden Namen finden, aber Dokumentstruktur bewa
 _INTENSITY_PREFIX = {
     INTENSITY_HARD: (
         "WICHTIGER HINWEIS ZUR INTENSITÄT: Arbeite MAXIMAL GRÜNDLICH. "
-        "Im Zweifel IMMER schwärzen. Jede noch so kleine Möglichkeit, "
-        "dass es sich um personenbezogene Daten handelt, muss erfasst werden. "
-        "Lieber 10× zu viel als 1× zu wenig. Sei paranoid gründlich!\n\n"
+        "Im Zweifel schwärzen. Aber: nur ECHTE personenbezogene Daten. "
+        "Strukturelemente des Dokuments (Nummerierungen, §§, Gliederungen) "
+        "sind KEINE PII und dürfen NIEMALS gemeldet werden.\n\n"
     ),
 }
 
