@@ -530,7 +530,7 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars",
     Returns ``(final_rect, label, font_size, category)`` for the overlay.
     """
     if mode == "anonymize" or not label:
-        # fill=REDACT_BG → annotation only removes content; overlay handles visuals
+        # fill=REDACT_BG: removes text + blanks scan pixels; overlay adds visuals
         page.add_redact_annot(rect, text="", fill=REDACT_BG)
         return (fitz.Rect(rect), "", 0, category)
 
@@ -573,7 +573,7 @@ def _add_redaction(page, rect: fitz.Rect, label: str, mode: str = "pseudo_vars",
         new_x1 = min(rect.x0 + rect.width + extra, page_rect.width - 2)
         final_rect = fitz.Rect(rect.x0, rect.y0, new_x1, rect.y1)
 
-    # fill=REDACT_BG → annotation only removes content; overlay handles visuals
+    # fill=REDACT_BG: removes text + blanks scan pixels; overlay adds visuals
     page.add_redact_annot(
         final_rect,
         text="",
@@ -1269,9 +1269,10 @@ def _detect_signatures_with_vision(page, api_key: str) -> List[fitz.Rect]:
 def _draw_redaction_overlays(page, overlays: list, entity_map=None):
     """Draw elegant redaction boxes over areas where content was removed.
 
-    This is the ONLY visual rendering step – annotations use ``fill=REDACT_BG``
-    so they only delete content.  All visual fill and label drawing happens
-    here, guaranteeing consistent appearance on every PDF type.
+    Annotations use ``fill=REDACT_BG`` which (a) deletes text content and
+    (b) blanks scan-image pixels.  This overlay step adds the polished
+    visual treatment on top, guaranteeing consistent appearance on every
+    PDF type – both native text PDFs and scanned documents.
 
     Design language:
     - Deep navy-charcoal fill (REDACT_BG)
