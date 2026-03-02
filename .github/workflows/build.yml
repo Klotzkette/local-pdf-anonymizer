@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
-      - "claude/**"
     tags:
       - "v*"
   workflow_dispatch:
@@ -96,7 +94,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "PDF Anonymizer – Download"
+          name: "PDF Anonymizer - Download"
           body: |
             ## PDF Anonymizer
 
@@ -110,21 +108,13 @@ jobs:
 
             ### Voraussetzungen
             - Windows 10/11 oder macOS 12+
-            - Ein API-Key für OpenAI, Anthropic (Claude) oder Google Gemini
-            - PDFs müssen Texterkennung (OCR) enthalten
+            - Ein API-Key fuer OpenAI, Anthropic (Claude) oder Google Gemini
+            - PDFs muessen Texterkennung (OCR) enthalten
 
             ### Erste Schritte
             1. Programm starten
-            2. Einstellungen öffnen → API-Key hinterlegen
-            3. PDF per Drag & Drop ablegen → Speicherort wählen → fertig!
-
-            ### Was wird anonymisiert?
-            Vornamen, Nachnamen, Adressen, Kontonummern/IBAN, E-Mails, Telefonnummern, Krypto-Adressen, Firmennamen, Grundstücksangaben, Geburtsdaten, Steuer-/Sozialversicherungsnummern, Ausweisnummern, **Geldbeträge/Währungen**, **Unterschriften/Handschrift** – in allen Sprachen.
-
-            Rechtliche Normen, Paragraphen (§) und Gesetzesverweise werden **nicht** anonymisiert.
-
-            Variablen: A, B, C, … F, 10, 11, … (Hexadezimal ab A).
-            Anonymisierte Stellen werden schwarz geschwärzt. Am Ende wird ein Variablen-Verzeichnis angehängt.
+            2. Einstellungen oeffnen, API-Key hinterlegen
+            3. PDF per Drag & Drop ablegen, Speicherort waehlen, fertig!
           files: |
             artifacts/PDFAnonymizer.exe
             artifacts/PDFAnonymizer-Mac.zip
