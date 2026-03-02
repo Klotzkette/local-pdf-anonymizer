@@ -41,32 +41,51 @@ Die anonymisierten Stellen werden **türkis** überdeckt, die Variable wird in w
   - **Anthropic** (Claude) – `sk-ant-...`
   - **Google Gemini** – `AI...`
 
-## Installation & Build (Windows EXE)
+## Installation
 
 ### Voraussetzungen
 
 - Python 3.10 oder neuer
 - pip
 
-### Schritte
+### Virtuelle Umgebung erstellen und aktivieren
+
+Es wird empfohlen, das Projekt in einer virtuellen Umgebung (venv) auszuführen, damit die Abhängigkeiten isoliert vom System-Python bleiben.
 
 ```bash
-# 1. Abhängigkeiten installieren
+# 1. Virtuelle Umgebung erstellen (einmalig)
+python -m venv venv
+
+# 2. Virtuelle Umgebung aktivieren
+#    Windows (CMD):
+venv\Scripts\activate
+#    Windows (PowerShell):
+venv\Scripts\Activate.ps1
+#    macOS / Linux:
+source venv/bin/activate
+
+# 3. Abhängigkeiten installieren
 pip install -r requirements.txt
-
-# 2. Direkt starten (ohne Build)
-python src/main.py
-
-# 3. Oder als EXE bauen
-build.bat
-# Ergebnis: dist\PDFAnonymizer\PDFAnonymizer.exe
 ```
 
-### Alternativ mit PyInstaller direkt
+Nach der Aktivierung erscheint `(venv)` am Anfang der Kommandozeile. Die Umgebung bleibt aktiv, bis man `deactivate` eingibt oder das Terminal schließt.
+
+### Programm starten
 
 ```bash
-pip install -r requirements.txt
+python src/main.py
+```
+
+### Als Windows-EXE bauen (optional)
+
+```bash
+# Variante 1: über das Build-Skript
+build.bat
+
+# Variante 2: direkt mit PyInstaller
 pyinstaller build.spec
+
+# Ergebnis: dist\PDFAnonymizer\PDFAnonymizer.exe
 ```
 
 ## Unterstützte KI-Anbieter
