@@ -1,5 +1,8 @@
 """
-AI Engine – OpenAI GPT-5.2 powered PII entity detection.
+AI Engine – Local Qwen3.5-9B powered PII entity detection.
+
+The model is downloaded from HuggingFace on first use and runs entirely
+offline afterwards.  No API key required.
 
 Handles large texts by splitting into chunks that fit within AI token limits
 and merging results, ensuring consistent variable assignment across chunks.
@@ -7,6 +10,8 @@ and merging results, ensuring consistent variable assignment across chunks.
 
 import json
 import re
+import threading
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 # ---------------------------------------------------------------------------
@@ -241,45 +246,195 @@ def _parse_ai_response(response_text: str) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Local Qwen3.5-9B model – download, load, inference
+# ---------------------------------------------------------------------------
+
+MODEL_ID = "Qwen/Qwen3.5-9B"
+MODEL_DISPLAY_NAME = "Qwen3.5-9B"
+
+# Module-level model cache (loaded once, reused for every call)
+_model = None
+_tokenizer = None
+
+
+def is_model_downloaded() -> bool:
+    """Return True if Qwen3.5-9B is available in the local HuggingFace cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        result = try_to_load_from_cache(MODEL_ID, "config.json")
+        return result is not None
+    except Exception:
+        return False
+
+
+def download_model(progress_callback=None) -> None:
+    """Download Qwen3.5-9B from HuggingFace into the local cache.
+
+    *progress_callback(pct: int, msg: str)* is called periodically.
+    Pass pct=-1 for indeterminate progress.
+    """
+    from huggingface_hub import snapshot_download, HfApi
+
+    if progress_callback:
+        progress_callback(0, f"Verbinde mit HuggingFace: {MODEL_ID} …")
+
+    # Try to get total expected size for a meaningful progress bar
+    total_bytes = 0
+    try:
+        api = HfApi()
+        info = api.model_info(MODEL_ID, files_metadata=True)
+        total_bytes = sum(
+            (f.size or 0)
+            for f in (info.siblings or [])
+            if f.rfilename and not f.rfilename.endswith((".gguf", ".ggml"))
+        )
+    except Exception:
+        pass
+
+    # HuggingFace stores the model here
+    model_cache_name = "models--" + MODEL_ID.replace("/", "--")
+    model_cache_dir = (
+        Path.home() / ".cache" / "huggingface" / "hub" / model_cache_name
+    )
+
+    download_done = threading.Event()
+
+    def _monitor():
+        while not download_done.is_set():
+            if total_bytes > 0:
+                try:
+                    current = sum(
+                        f.stat().st_size
+                        for f in model_cache_dir.rglob("*")
+                        if f.is_file()
+                    )
+                    pct = min(95, int(current * 100 / total_bytes))
+                    msg = (
+                        f"Lade herunter: {current / 1e9:.1f} GB"
+                        f" / {total_bytes / 1e9:.1f} GB"
+                    )
+                except Exception:
+                    pct = -1
+                    msg = "Lade herunter …"
+            else:
+                pct = -1
+                msg = "Lade herunter …"
+            if progress_callback:
+                progress_callback(pct, msg)
+            download_done.wait(3.0)
+
+    monitor_thread = threading.Thread(target=_monitor, daemon=True)
+    monitor_thread.start()
+
+    try:
+        snapshot_download(
+            repo_id=MODEL_ID,
+            ignore_patterns=["*.gguf", "*.ggml"],
+        )
+    finally:
+        download_done.set()
+
+    if progress_callback:
+        progress_callback(100, "Download abgeschlossen")
+
+
+def _load_model():
+    """Load Qwen3.5-9B into memory (cached globally after first call)."""
+    global _model, _tokenizer
+    if _model is not None:
+        return _model, _tokenizer
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    _model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.bfloat16,
+        device_map="auto",
+    )
+    _model.eval()
+    return _model, _tokenizer
+
+
+def _run_qwen_inference(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.0,
+    max_new_tokens: int = 16384,
+) -> str:
+    """Run a single inference call with the local Qwen model."""
+    import torch
+
+    model, tokenizer = _load_model()
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # Qwen3 supports enable_thinking=False to skip chain-of-thought output
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    generate_kwargs: dict = dict(
+        **model_inputs,
+        max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    if temperature > 0.01:
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = temperature
+        generate_kwargs["top_p"] = 0.9
+    else:
+        generate_kwargs["do_sample"] = False
+
+    with torch.no_grad():
+        generated_ids = model.generate(**generate_kwargs)
+
+    output_ids = generated_ids[0][model_inputs.input_ids.shape[1]:]
+    return tokenizer.decode(output_ids, skip_special_tokens=True)
+
+
+# ---------------------------------------------------------------------------
 # Provider implementations
 # ---------------------------------------------------------------------------
 
-MODEL = "gpt-5.2"
-
-
-def detect_entities_openai(
-    api_key: str,
+def detect_entities_qwen(
+    api_key: str,        # unused – kept for API compatibility
     text: str,
     intensity: str = INTENSITY_HARD,
     scope: str = SCOPE_ALL,
 ) -> List[Dict[str, str]]:
-    """Use OpenAI GPT-5.2 to detect PII entities."""
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
+    """Detect PII entities using the local Qwen3.5-9B model."""
     user_prompt = _build_user_prompt(text, intensity, scope)
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.0,
-        max_completion_tokens=16384,
-    )
-    entities = _parse_ai_response(response.choices[0].message.content)
+    response = _run_qwen_inference(SYSTEM_PROMPT, user_prompt, temperature=0.0)
+    entities = _parse_ai_response(response)
 
-    # Post-filter for person-data scope (belt and suspenders)
     if scope == SCOPE_NAMES_ONLY:
         entities = [e for e in entities if e["category"] in _PERSON_CATEGORIES]
 
     return entities
 
 
-def generate_natural_replacements_openai(
-    api_key: str, entities: List[Dict[str, str]]
+def generate_natural_replacements_qwen(
+    api_key: str,        # unused – kept for API compatibility
+    entities: List[Dict[str, str]],
 ) -> Dict[str, str]:
-    """Use OpenAI GPT-5.2 to generate natural-sounding replacement values."""
-    # Build concise list (deduplicated, skip signatures)
+    """Generate natural-sounding replacements using the local Qwen3.5-9B model."""
     items = []
     seen: set = set()
     for ent in entities:
@@ -291,21 +446,12 @@ def generate_natural_replacements_openai(
         return {}
 
     entities_json = json.dumps(items, ensure_ascii=False, indent=2)
-
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": REPLACEMENT_SYSTEM_PROMPT},
-            {"role": "user", "content": REPLACEMENT_USER_TEMPLATE.format(
-                entities_json=entities_json,
-            )},
-        ],
+    response = _run_qwen_inference(
+        REPLACEMENT_SYSTEM_PROMPT,
+        REPLACEMENT_USER_TEMPLATE.format(entities_json=entities_json),
         temperature=0.7,
-        max_completion_tokens=16384,
     )
-    text = response.choices[0].message.content.strip()
+    text = response.strip()
     fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
@@ -318,11 +464,11 @@ def generate_natural_replacements_openai(
 # ---------------------------------------------------------------------------
 
 PROVIDERS = {
-    "openai": detect_entities_openai,
+    "qwen": detect_entities_qwen,
 }
 
 REPLACEMENT_PROVIDERS = {
-    "openai": generate_natural_replacements_openai,
+    "qwen": generate_natural_replacements_qwen,
 }
 
 

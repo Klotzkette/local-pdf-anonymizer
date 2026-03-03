@@ -15,7 +15,10 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
-        'openai',
+        'transformers',
+        'torch',
+        'huggingface_hub',
+        'accelerate',
         'PyQt6',
         'fitz',
     ],

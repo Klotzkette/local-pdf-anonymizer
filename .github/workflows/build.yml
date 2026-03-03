@@ -96,7 +96,7 @@ jobs:
           tag_name: latest
           name: "PDF Anonymizer - Download"
           body: |
-            ## PDF Anonymizer
+            ## PDF Anonymizer – Lokale KI-Anonymisierung
 
             **Downloads:**
             - **Windows:** `PDFAnonymizer.exe` herunterladen und starten
@@ -106,15 +106,20 @@ jobs:
 
             ---
 
-            ### Voraussetzungen
-            - Windows 10/11 oder macOS 12+
-            - Ein API-Key fuer OpenAI, Anthropic (Claude) oder Google Gemini
-            - PDFs muessen Texterkennung (OCR) enthalten
+            ### Was ist neu (v3.0)
+            - **Lokales KI-Modell:** Qwen3.5-9B laeuft direkt auf Ihrem Rechner
+            - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
+            - **Datenschutz:** Keine Daten verlassen Ihr Geraet
 
             ### Erste Schritte
             1. Programm starten
-            2. Einstellungen oeffnen, API-Key hinterlegen
+            2. Unter Einstellungen das KI-Modell herunterladen (~18 GB, einmalig)
             3. PDF per Drag & Drop ablegen, Speicherort waehlen, fertig!
+
+            ### Systemanforderungen
+            - Windows 10/11 oder macOS 12+
+            - Mindestens 16 GB RAM
+            - ~18 GB freier Speicherplatz fuer das KI-Modell
           files: |
             artifacts/PDFAnonymizer.exe
             artifacts/PDFAnonymizer-Mac.zip
