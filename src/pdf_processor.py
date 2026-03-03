@@ -1053,12 +1053,6 @@ def _detect_and_redact_signatures(page, is_scan: bool = False):
         _redact_bottom_zone_scan(page)
 
 
-# ---------------------------------------------------------------------------
-# Smart vision page selection – avoid unnecessary API calls
-# ---------------------------------------------------------------------------
-
-
-
 
 _KAPPA = 0.5522847498  # cubic Bézier approximation of a quarter-circle
 
