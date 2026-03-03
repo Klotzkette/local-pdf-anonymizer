@@ -59,6 +59,8 @@ try:
         MODE_ANONYMIZE, MODE_PSEUDO_VARS, MODE_PSEUDO_NATURAL,
         INTENSITY_HARD,
         SCOPE_NAMES_ONLY, SCOPE_ALL,
+        is_model_downloaded, download_model,
+        MODEL_DISPLAY_NAME,
     )
     from pdf_processor import (
         extract_text, redact_pdf, get_page_count,
@@ -73,6 +75,9 @@ except ImportError as _imp_err:
     SCOPE_NAMES_ONLY = "names_only"
     SCOPE_ALL = "all"
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".jpg", ".jpeg"}
+    MODEL_DISPLAY_NAME = "Qwen3.5-9B"
+    def is_model_downloaded(): return False
+    def download_model(progress_callback=None): pass
 else:
     _import_error = None
 
@@ -702,6 +707,13 @@ class AnonymizeWorker(QThread):
 
     def run(self):
         try:
+            # Step 0 – load model into memory (first call takes a while)
+            self.step.emit("Modell laden …")
+            self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) wird in den Speicher geladen …")
+            self.progress.emit(1)
+            from ai_engine import _load_model
+            _load_model()
+
             # Step 1 – prepare input (convert / OCR if needed)
             self.step.emit("Schritt 1/5  –  Datei vorbereiten")
             self.status.emit("Eingabedatei wird vorbereitet …")
@@ -800,65 +812,93 @@ class AnonymizeWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Settings dialog (polished)
+# Model download worker thread
 # ---------------------------------------------------------------------------
 
-PROVIDER_NAMES = {
-    "openai":    "OpenAI (GPT-5.2)",
-}
-PROVIDER_KEYS = ["openai"]
-PROVIDER_PLACEHOLDERS = {
-    "openai":    "sk-...",
-}
+class ModelDownloadWorker(QThread):
+    """Downloads Qwen3.5-9B from HuggingFace in the background."""
 
+    progress = pyqtSignal(int)    # -1 = indeterminate, 0-100 = percentage
+    status   = pyqtSignal(str)
+    finished_ok  = pyqtSignal()
+    finished_err = pyqtSignal(str)
+
+    def run(self):
+        try:
+            def _cb(pct: int, msg: str):
+                self.progress.emit(pct)
+                self.status.emit(msg)
+
+            download_model(progress_callback=_cb)
+            self.finished_ok.emit()
+        except Exception as e:
+            import traceback
+            self.finished_err.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+# ---------------------------------------------------------------------------
+# Settings / Model management dialog
+# ---------------------------------------------------------------------------
 
 class SettingsDialog(QDialog):
+    """KI-Modell-Verwaltung: Download-Status und Download-Button."""
+
+    model_status_changed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Einstellungen")
-        self.setMinimumWidth(480)
+        self.setWindowTitle("KI-Modell")
+        self.setMinimumWidth(500)
         self.setStyleSheet(STYLESHEET)
+        self._download_worker: ModelDownloadWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(16)
         layout.setContentsMargins(32, 28, 32, 24)
 
         # -- Header --
-        header = QLabel("\u2699  Einstellungen")
-        header.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 18px; letter-spacing: -0.3px;")
-        layout.addWidget(header)
-        desc = QLabel("Hinterlegen Sie Ihren OpenAI API-Key f\u00fcr die KI-Analyse.")
-        desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
-        layout.addWidget(desc)
-
-        layout.addSpacing(8)
-
-        # -- Model info pill --
-        model_label = QLabel("\u2728  Modell: GPT-5.2")
-        model_label.setStyleSheet(
-            f"color: {ACCENT}; font-size: 12px; "
-            f"background-color: #EBF4FF; "
-            f"border: 1px solid {ACCENT_GLOW}; "
-            f"border-radius: 10px; padding: 8px 14px;"
+        header = QLabel(f"\u2728  KI-Modell: {MODEL_DISPLAY_NAME}")
+        header.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 18px; letter-spacing: -0.3px;"
         )
-        layout.addWidget(model_label)
+        layout.addWidget(header)
+
+        desc = QLabel(
+            "Das Modell wird lokal auf Ihrem Ger\u00e4t gespeichert und ausgef\u00fchrt.\n"
+            "Es wird kein API-Key ben\u00f6tigt und keine Daten werden \u00fcbertragen."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px; line-height: 1.5;")
+        layout.addWidget(desc)
 
         layout.addSpacing(4)
 
-        # -- API key --
-        keys_group = QGroupBox("API-Key")
-        keys_layout = QFormLayout(keys_group)
-        keys_layout.setSpacing(10)
+        # -- Model info box --
+        info_box = QGroupBox("Modell-Informationen")
+        info_layout = QFormLayout(info_box)
+        info_layout.setSpacing(8)
+        info_layout.addRow(
+            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter)")
+        )
+        info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
+        info_layout.addRow("Typ:", QLabel("Vision-Language-Modell, lokal"))
+        info_layout.addRow(
+            "Speicherbedarf:", QLabel("\u223C 18 GB Download  \u00b7  \u223C 16 GB RAM")
+        )
+        layout.addWidget(info_box)
 
-        self.key_field = QLineEdit(load_api_key("openai"))
-        self.key_field.setPlaceholderText("sk-...")
-        self.key_field.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_field.setMinimumHeight(38)
-        self.key_field.textChanged.connect(self._on_key_changed)
-        keys_layout.addRow("OpenAI:", self.key_field)
+        # -- Status + progress --
+        self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        layout.addWidget(self._status_label)
 
-        layout.addWidget(keys_group)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setFixedHeight(20)
+        self._progress_bar.setVisible(False)
+        layout.addWidget(self._progress_bar)
+
         layout.addStretch()
 
         # -- Buttons --
@@ -866,28 +906,101 @@ class SettingsDialog(QDialog):
         btn_layout.setSpacing(10)
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("Abbrechen")
-        cancel_btn.setObjectName("selectBtn")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
+        self._close_btn = QPushButton("Schlie\u00dfen")
+        self._close_btn.setObjectName("selectBtn")
+        self._close_btn.clicked.connect(self._on_close)
+        btn_layout.addWidget(self._close_btn)
 
-        save_btn = QPushButton("\u2713  Speichern")
-        save_btn.setMinimumWidth(130)
-        save_btn.clicked.connect(self.save_and_close)
-        btn_layout.addWidget(save_btn)
+        self._download_btn = QPushButton("\u2193  Modell herunterladen")
+        self._download_btn.setMinimumWidth(200)
+        self._download_btn.clicked.connect(self._start_download)
+        btn_layout.addWidget(self._download_btn)
 
         layout.addLayout(btn_layout)
 
-    def _on_key_changed(self):
-        """Give a green border hint when the key field has content."""
-        has_value = bool(self.key_field.text().strip())
-        self.key_field.setProperty("valid", has_value)
-        self.key_field.style().unpolish(self.key_field)
-        self.key_field.style().polish(self.key_field)
+        self._refresh_status()
 
-    def save_and_close(self):
-        save_api_key("openai", self.key_field.text().strip())
-        save_provider("openai")
+    # ------------------------------------------------------------------
+
+    def _refresh_status(self):
+        if is_model_downloaded():
+            self._status_label.setText(
+                f"\u2713  {MODEL_DISPLAY_NAME} ist heruntergeladen und einsatzbereit."
+            )
+            self._status_label.setStyleSheet(
+                f"color: {SUCCESS}; font-size: 13px;"
+            )
+            self._download_btn.setVisible(False)
+        else:
+            self._status_label.setText(
+                f"Das Modell wurde noch nicht heruntergeladen.\n"
+                f"Dr\u00fccken Sie \u201eModell herunterladen\u201c, um zu starten."
+            )
+            self._status_label.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 12px;"
+            )
+            self._download_btn.setVisible(True)
+
+    def _start_download(self):
+        if self._download_worker and self._download_worker.isRunning():
+            return
+
+        self._download_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._status_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 12px;"
+        )
+        self._status_label.setText(f"Starte Download von {MODEL_DISPLAY_NAME} …")
+
+        self._download_worker = ModelDownloadWorker()
+        self._download_worker.progress.connect(self._on_dl_progress)
+        self._download_worker.status.connect(self._on_dl_status)
+        self._download_worker.finished_ok.connect(self._on_dl_ok)
+        self._download_worker.finished_err.connect(self._on_dl_err)
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        self._download_worker.start()
+
+    def _on_dl_progress(self, pct: int):
+        if pct < 0:
+            # Indeterminate
+            self._progress_bar.setRange(0, 0)
+        else:
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(pct)
+
+    def _on_dl_status(self, msg: str):
+        self._status_label.setText(msg)
+
+    def _on_dl_ok(self):
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(100)
+        self._close_btn.setEnabled(True)
+        self._refresh_status()
+        self.model_status_changed.emit()
+
+    def _on_dl_err(self, msg: str):
+        self._progress_bar.setVisible(False)
+        self._download_btn.setEnabled(True)
+        self._close_btn.setEnabled(True)
+        self._status_label.setText(f"Fehler beim Download:\n{msg.splitlines()[0]}")
+        self._status_label.setStyleSheet(f"color: {ERROR}; font-size: 12px;")
+
+    def _on_close(self):
+        if self._download_worker and self._download_worker.isRunning():
+            # Ask for confirmation before interrupting download
+            reply = QMessageBox.question(
+                self,
+                "Download l\u00e4uft",
+                "Der Download l\u00e4uft noch. Wirklich abbrechen?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._download_worker.terminate()
         self.accept()
 
 
@@ -1224,12 +1337,11 @@ class MainWindow(QMainWindow):
     # -- Helpers --
 
     def _update_provider_pill(self):
-        has_key = bool(load_api_key("openai"))
-        if has_key:
-            self.provider_pill.setText("GPT-5.2")
-            self.provider_pill.setStyleSheet("")  # reset to default from stylesheet
+        if is_model_downloaded():
+            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Lokal")
+            self.provider_pill.setStyleSheet("")  # default stylesheet
         else:
-            self.provider_pill.setText("GPT-5.2  \u00b7  kein Key")
+            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  nicht geladen")
             self.provider_pill.setStyleSheet(
                 f"color: {ERROR}; background-color: {ERROR_BG}; "
                 f"border: 1px solid {ERROR_BORDER}; "
@@ -1237,12 +1349,14 @@ class MainWindow(QMainWindow):
             )
 
     def _update_statusbar_idle(self):
-        prov = load_provider()
-        has_key = bool(load_api_key(prov))
-        if has_key:
-            self.statusBar().showMessage("Bereit  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v2.0")
+        if is_model_downloaded():
+            self.statusBar().showMessage(
+                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v2.0"
+            )
         else:
-            self.statusBar().showMessage("Bitte zuerst einen API-Key in den Einstellungen hinterlegen  \u00b7  v2.0")
+            self.statusBar().showMessage(
+                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v2.0"
+            )
 
     def _current_mode(self) -> str:
         return self._selected_mode
@@ -1273,9 +1387,11 @@ class MainWindow(QMainWindow):
 
     def open_settings(self):
         dlg = SettingsDialog(self)
-        if dlg.exec():
-            self._update_provider_pill()
-            self._update_statusbar_idle()
+        dlg.model_status_changed.connect(self._update_provider_pill)
+        dlg.model_status_changed.connect(self._update_statusbar_idle)
+        dlg.exec()
+        self._update_provider_pill()
+        self._update_statusbar_idle()
 
     def browse_pdf(self):
         if self.worker and self.worker.isRunning():
@@ -1319,20 +1435,23 @@ class MainWindow(QMainWindow):
         if not self.current_pdf:
             return
 
-        # Check API key
-        provider = load_provider()
-        api_key = load_api_key(provider)
-        if not api_key:
-            QMessageBox.warning(
+        # Check that the model has been downloaded
+        if not is_model_downloaded():
+            reply = QMessageBox.question(
                 self,
-                "Kein API-Key",
-                f"Bitte hinterlegen Sie zuerst einen API-Key für\n"
-                f"{PROVIDER_NAMES.get(provider, provider)} in den Einstellungen.",
+                "KI-Modell nicht geladen",
+                f"Das KI-Modell ({MODEL_DISPLAY_NAME}) wurde noch nicht\n"
+                f"heruntergeladen.\n\nJetzt herunterladen?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
             )
-            self.open_settings()
-            api_key = load_api_key(load_provider())
-            if not api_key:
+            if reply == QMessageBox.StandardButton.Yes:
+                self.open_settings()
+            if not is_model_downloaded():
                 return
+
+        provider = "qwen"
+        api_key = ""
 
         # Show mode selection dialog
         mode_dlg = ModeSelectionDialog(self)
