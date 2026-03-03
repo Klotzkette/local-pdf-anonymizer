@@ -1,5 +1,5 @@
 """
-PDF Anonymizer – Modern PyQt6 GUI with drag & drop, API key settings,
+PDF Anonymizer – Modern PyQt6 GUI with drag & drop, local AI model management,
 and one-click anonymisation workflow.
 
 Design: Soft blue-teal tones with black accents, Arial font, no bold text.
@@ -92,26 +92,6 @@ SETTINGS_APP = "toms_super_simple_pdf_anonymizer"
 
 def _settings() -> QSettings:
     return QSettings(SETTINGS_ORG, SETTINGS_APP)
-
-
-def save_api_key(provider: str, key: str):
-    s = _settings()
-    s.setValue(f"api_keys/{provider}", key)
-
-
-def load_api_key(provider: str) -> str:
-    s = _settings()
-    return s.value(f"api_keys/{provider}", "")
-
-
-def save_provider(provider: str):
-    s = _settings()
-    s.setValue("selected_provider", provider)
-
-
-def load_provider() -> str:
-    s = _settings()
-    return s.value("selected_provider", "openai")
 
 
 def save_output_dir(path: str):
@@ -881,7 +861,7 @@ class SettingsDialog(QDialog):
             "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter)")
         )
         info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
-        info_layout.addRow("Typ:", QLabel("Vision-Language-Modell, lokal"))
+        info_layout.addRow("Typ:", QLabel("Sprachmodell, lokal"))
         info_layout.addRow(
             "Speicherbedarf:", QLabel("\u223C 18 GB Download  \u00b7  \u223C 16 GB RAM")
         )
@@ -1331,7 +1311,7 @@ class MainWindow(QMainWindow):
         main_layout.addSpacing(2)
 
         # ── Status bar ──
-        self.statusBar().showMessage("Bereit  \u00b7  v2.0")
+        self.statusBar().showMessage("Bereit  \u00b7  v3.0")
         self._update_statusbar_idle()
 
     # -- Helpers --
@@ -1351,11 +1331,11 @@ class MainWindow(QMainWindow):
     def _update_statusbar_idle(self):
         if is_model_downloaded():
             self.statusBar().showMessage(
-                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v2.0"
+                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.0"
             )
         else:
             self.statusBar().showMessage(
-                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v2.0"
+                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.0"
             )
 
     def _current_mode(self) -> str:

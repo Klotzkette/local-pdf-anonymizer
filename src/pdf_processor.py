@@ -133,87 +133,6 @@ def _ocr_pdf(pdf_path: str) -> str:
         raise RuntimeError(f"OCR-Fehler: {e}")
 
 
-_VISION_OCR_PROMPT = """Extrahiere den VOLLSTÄNDIGEN Text aus diesem Dokument-Scan / Bild.
-
-REGELN:
-- Gib den Text EXAKT so wieder wie er im Dokument steht
-- Behalte die Struktur bei (Absätze, Aufzählungen, Einrückungen)
-- Für Tabellen: verwende | als Spalten-Trenner und neue Zeilen für Reihen
-- Überspringe KEINEN Text – auch Fußnoten, Seitenzahlen, Kopfzeilen, Briefköpfe
-- Handschriftliche Texte: versuche zu lesen, wenn unleserlich markiere als [HANDSCHRIFT]
-- Unterschriften: markiere als [UNTERSCHRIFT]
-- Ignoriere reine Grafiken/Bilder/Logos (nur Text extrahieren)
-- Gib NUR den extrahierten Text zurück, KEINE Erklärungen oder Kommentare
-- Wenn kein Text erkennbar: antworte mit [KEIN TEXT]"""
-
-
-def _gpt_vision_ocr(pdf_path: str, api_key: str,
-                     status_callback: Optional[Callable[[str], None]] = None) -> str:
-    """Use GPT-5.2 Vision to extract text from image-based PDF pages.
-
-    Renders each page as a JPEG, sends to GPT-5.2 Vision for text
-    extraction.  Much better quality than Tesseract OCR, especially for
-    handwriting, complex layouts, and multi-language documents.
-
-    Returns the path to a new text-based PDF containing the extracted text.
-    """
-    import base64
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    doc = fitz.open(pdf_path)
-    all_text: List[str] = []
-    total = len(doc)
-
-    for idx in range(total):
-        page = doc[idx]
-        if status_callback:
-            status_callback(f"KI liest Seite {idx + 1}/{total} …")
-
-        # Render at 200 DPI for good quality
-        mat = fitz.Matrix(200.0 / 72.0, 200.0 / 72.0)
-        try:
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-        except Exception:
-            all_text.append("")
-            continue
-
-        img_bytes = pix.tobytes("jpeg")
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-5.2",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_OCR_PROMPT},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}",
-                            "detail": "high",
-                        }},
-                    ],
-                }],
-                temperature=0.0,
-                max_completion_tokens=8192,
-            )
-            page_text = resp.choices[0].message.content.strip()
-            if page_text == "[KEIN TEXT]":
-                page_text = ""
-            all_text.append(page_text)
-        except Exception:
-            all_text.append("")
-
-    doc.close()
-    full_text = "\n\n".join(all_text)
-
-    if not full_text.strip():
-        raise ValueError(
-            "GPT-5.2 Vision konnte keinen Text im Dokument erkennen."
-        )
-
-    return _text_to_pdf(full_text)
-
 
 def _text_to_pdf(full_text: str) -> str:
     """Create a multi-page PDF from plain text. Returns temp file path."""
@@ -341,20 +260,10 @@ def _docx_to_pdf(docx_path: str) -> str:
     return _text_to_pdf(full_text)
 
 
-def _do_ocr(pdf_path: str, api_key: Optional[str],
+def _do_ocr(pdf_path: str, api_key: Optional[str] = None,
             status_callback: Optional[Callable[[str], None]] = None) -> str:
-    """Extract text from an image-based PDF using GPT Vision (preferred)
-    or Tesseract OCR (fallback).  Returns path to a text-based temp PDF."""
-    # --- Primary: GPT-5.2 Vision ---
-    if api_key:
-        try:
-            if status_callback:
-                status_callback("KI-Texterkennung wird durchgeführt …")
-            return _gpt_vision_ocr(pdf_path, api_key, status_callback)
-        except Exception:
-            pass  # fall through to Tesseract
-
-    # --- Fallback: Tesseract OCR ---
+    """Extract text from an image-based PDF using Tesseract OCR.
+    Returns path to a text-based temp PDF."""
     if status_callback:
         status_callback("OCR wird durchgeführt …")
     return _ocr_pdf(pdf_path)
@@ -369,8 +278,7 @@ def prepare_input(
 
     Accepts PDF, DOCX, DOC, JPG, and JPEG.
     Converts non-PDF files to PDF.  For image-based content, uses
-    GPT-5.2 Vision (if *api_key* given) or Tesseract OCR as fallback
-    to extract text.
+    Tesseract OCR to extract text.
 
     Returns the path to a PDF with a text layer.
     If the returned path differs from *input_path*, it is a temporary file
@@ -1149,200 +1057,7 @@ def _detect_and_redact_signatures(page, is_scan: bool = False):
 # Smart vision page selection – avoid unnecessary API calls
 # ---------------------------------------------------------------------------
 
-# Keywords in page text that suggest a signature / handwriting may be present.
-_SIG_HINT_WORDS = _re.compile(
-    r"unterschrift|signatur|gez\.|gezeichnet|unterzeichn|handzeichen|"
-    r"vollmacht|bevollmächtigt|hiermit bestätig|eigenhändig|"
-    r"ort.*datum|datum.*ort|i\.\s*[av]\.|ppa\.|zur kenntnis|"
-    r"genehmigt|freigegeben|bestätigt durch|verantwortlich|"
-    r"signature|signed|witness|approved|authorized",
-    _re.IGNORECASE,
-)
 
-
-def _page_needs_vision(page, page_idx: int, total_pages: int) -> bool:
-    """Decide whether a page is worth sending to the Vision API.
-
-    Returns True for:
-    - First and last page (almost always contain signatures/logos)
-    - Second page and second-to-last (common for multi-page contracts)
-    - Any page whose text contains signature-related keywords
-    - Documents with 4 or fewer pages (scan everything)
-    """
-    if total_pages <= 4:
-        return True
-    if page_idx <= 1 or page_idx >= total_pages - 2:
-        return True
-    try:
-        text = page.get_text("text")
-        if _SIG_HINT_WORDS.search(text):
-            return True
-    except Exception:
-        pass
-    return False
-
-
-# ---------------------------------------------------------------------------
-# GPT-5.2 Vision-based signature detection  (catch-all for missed handwriting)
-# ---------------------------------------------------------------------------
-
-_VISION_PROMPT = """Du bist ein forensischer Dokumentenprüfer für Datenschutz-Anonymisierung.
-Deine EINZIGE Aufgabe: ALLE handschriftlichen und visuellen Elemente finden, die eine Person identifizieren könnten.
-
-SYSTEMATISCHE PRÜFUNG – gehe das Bild in dieser Reihenfolge durch:
-
-SCHRITT 1: Scanne den UNTEREN DRITTEL des Dokuments (dort sind 80% aller Unterschriften).
-   Suche nach JEDER Art von Tintenstrich, Schnörkel, Kurve, die NICHT maschinell gedruckt ist.
-
-SCHRITT 2: Suche neben/unter jedem Text wie "Unterschrift", "gez.", "Datum/Unterschrift",
-   "Ort, Datum", "Signed", "i.A.", "i.V.", "ppa." – dort MUSS fast immer eine Signatur sein.
-   Auch wenn sie nur ein einzelner horizontaler Strich oder Kringel ist!
-
-SCHRITT 3: Scanne ALLE vier Ränder und Ecken auf Paraphen, Initialen, Häkchen.
-
-SCHRITT 4: Prüfe Kopfbereich auf Logos, Stempel, Siegel.
-
-TYPEN:
-1. type="unterschrift" – Handschriftliche Unterschriften, Signaturen, Namenszüge.
-   ACHTUNG: Unterschriften sehen SEHR unterschiedlich aus:
-   - Große geschwungene Bögen mit Schnörkeln
-   - Winzige unleserliche Kringel (1-2cm breit)
-   - Ein einzelner schräger Strich mit kleinem Häkchen
-   - Nur Initialen in Schreibschrift ("JM", "SW")
-   - Punkte und Striche die zusammen einen Namen andeuten
-   - Blaue, schwarze, graue oder verblasste Tinte
-   - Digital eingefügte Bilder von handschriftlichen Unterschriften
-   - Unterschriften die auf einer Linie sitzen (______)
-   - Unterschriften die mit der gedruckten Zeile "Unterschrift:" verschmelzen
-
-2. type="paraphe" – Handschriftliche Kürzel, Initialen, Häkchen, Paraphen.
-   Jede handschriftliche Markierung: Haken (✓), Kreuze (×), Kürzel,
-   handgeschriebene Buchstaben/Initialen, Randnotizen, "gez. [Name]" in Handschrift.
-   Auch: handschriftliche Datumsangaben, handgeschriebene Zahlen/Aktenzeichen.
-
-3. type="logo" – Firmenlogos, Markenzeichen, Wappen (nur echte Grafiken, kein reiner Text)
-
-4. type="stempel" – Firmenstempel, Amtsstempel, Siegel, Rundstempel (auch verblasst)
-
-5. type="foto" – Passfotos, Profilbilder, eingescannte Personenfotos
-
-NICHT MELDEN:
-- Maschinell gedruckten Text (auch kursiv, fett, oder unterstrichenen)
-- Tabellen-Linien, Rahmen, Trennstriche, Formular-Linien
-- Seitenzahlen, Fußnoten
-- Leere Unterschriftenzeilen OHNE handschriftliche Markierung
-
-GOLDENE REGEL: Lieber 5 Fehlalarme als 1 übersehene Unterschrift!
-Eine übersehene Signatur = DSGVO-Verstoß. Melde ALLES was auch nur
-ENTFERNT handschriftlich aussehen KÖNNTE.
-
-Bounding-Box: Prozent der Seitenbreite/-höhe. Box soll die Signatur
-KOMPLETT einschließen inkl. Ausläufer und Schnörkel – lieber etwas
-ZU GROSS als zu klein.
-
-Antworte NUR mit JSON:
-{
-  "signatures": [
-    {"x_pct": 10, "y_pct": 85, "w_pct": 30, "h_pct": 8, "type": "unterschrift"}
-  ]
-}
-
-Wenn NICHTS gefunden wird: {"signatures": []}"""
-
-
-def _detect_visuals_with_vision(page, api_key: str) -> List[Tuple[fitz.Rect, str]]:
-    """Use GPT-5.2 vision to detect signatures, logos, stamps on *page*.
-
-    Renders the page as a JPEG, sends it to the vision model, and
-    returns a list of ``(fitz.Rect, type_str)`` tuples.
-    *type_str* is one of: unterschrift, paraphe, logo, stempel, foto.
-    """
-    import base64
-
-    page_rect = page.rect
-
-    # Render at 200 DPI – good detail for signatures, fast upload (vs 300 DPI)
-    scale = 200.0 / 72.0
-    mat = fitz.Matrix(scale, scale)
-    try:
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-    except Exception:
-        return []
-
-    # Convert to JPEG (quality 80 – good balance of detail and speed)
-    img_bytes = pix.tobytes("jpeg", jpg_quality=80)
-    b64_image = base64.b64encode(img_bytes).decode("utf-8")
-
-    # Call GPT-5.2 vision
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-5.2",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_image}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                },
-            ],
-            temperature=0.0,
-            max_completion_tokens=2048,
-        )
-    except Exception:
-        return []
-
-    # Parse response
-    try:
-        text = response.choices[0].message.content.strip()
-        fence = _re.search(r"```(?:json)?\s*\n?(.*?)```", text, _re.DOTALL)
-        if fence:
-            text = fence.group(1).strip()
-        data = _json.loads(text)
-        sigs = data.get("signatures", [])
-    except Exception:
-        return []
-
-    # Convert percentage-based bboxes to page coordinates
-    results: List[Tuple[fitz.Rect, str]] = []
-    pw = page_rect.width
-    ph = page_rect.height
-    for sig in sigs:
-        try:
-            x = page_rect.x0 + sig["x_pct"] / 100.0 * pw
-            y = page_rect.y0 + sig["y_pct"] / 100.0 * ph
-            w = sig["w_pct"] / 100.0 * pw
-            h = sig["h_pct"] / 100.0 * ph
-            rect = fitz.Rect(x, y, x + w, y + h)
-            sig_type = sig.get("type", "unterschrift")
-            # Sanity check: not the entire page; allow very small marks
-            if rect.width > 3 and rect.height > 2 and rect.width < pw * 0.95:
-                # Enforce minimum box size for signatures (GPT sometimes
-                # reports very tight boxes that miss stroke tails/flourishes)
-                if sig_type in ("unterschrift", "paraphe"):
-                    min_w = max(rect.width, 40)   # at least ~1.5cm
-                    min_h = max(rect.height, 14)   # at least ~0.5cm
-                    cx = rect.x0 + rect.width / 2
-                    cy = rect.y0 + rect.height / 2
-                    rect = fitz.Rect(
-                        max(page_rect.x0, cx - min_w / 2),
-                        max(page_rect.y0, cy - min_h / 2),
-                        min(page_rect.x1, cx + min_w / 2),
-                        min(page_rect.y1, cy + min_h / 2),
-                    )
-                results.append((rect, sig_type))
-        except (KeyError, TypeError):
-            continue
-
-    return results
 
 
 _KAPPA = 0.5522847498  # cubic Bézier approximation of a quarter-circle
@@ -1650,23 +1365,6 @@ def redact_pdf(
 
         # Redact signatures, handwriting, ink annotations, etc.
         _detect_and_redact_signatures(page, is_scan=page_is_scan)
-
-        # GPT-5.2 vision: detect signatures, logos, stamps, photos.
-        # Only runs on pages likely to contain visual PII (first, last,
-        # pages with signature-indicators) to avoid unnecessary API calls.
-        if api_key and _page_needs_vision(page, page_idx, total_pages):
-            vision_hits = _detect_visuals_with_vision(page, api_key)
-            for rect, vis_type in vision_hits:
-                # Generous margin for handwriting – flourishes/tails often
-                # extend beyond the core bounding box.
-                if vis_type == "unterschrift":
-                    margin = 4.0
-                elif vis_type == "paraphe":
-                    margin = 2.0
-                else:
-                    margin = _REDACT_MARGIN
-                expanded = _safe_expand_rect(rect, page, margin)
-                page.add_redact_annot(expanded, text="", fill=REDACT_BG)
 
         # Collect non-entity redaction rects (signatures, logos) from
         # annotations so we can re-draw them as overlays too.

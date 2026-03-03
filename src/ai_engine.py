@@ -455,7 +455,16 @@ def generate_natural_replacements_qwen(
     fence = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # Try to extract JSON from surrounding text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+        else:
+            return {}
     return data.get("replacements", {})
 
 

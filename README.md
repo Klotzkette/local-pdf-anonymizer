@@ -1,47 +1,63 @@
 # PDF Anonymizer
 
-KI-gestütztes Tool zur automatischen Anonymisierung personenbezogener Daten in PDF-Dokumenten.
+KI-gestütztes Tool zur automatischen Anonymisierung personenbezogener Daten in PDF-Dokumenten. Läuft komplett lokal – keine Cloud, kein API-Key, keine Kosten.
 
 ## Funktionsweise
 
 1. **Programm starten** – `PDFAnonymizer.exe` (Windows) oder `python src/main.py`
-2. **API-Key hinterlegen** – Über ⚙ Einstellungen den Key für OpenAI, Anthropic oder Google Gemini eingeben
-3. **PDF laden** – Per Drag & Drop oder über „PDF auswählen"
-4. **Speicherort wählen** – Das anonymisierte PDF wird dort abgelegt
-5. **Fertig** – Das Tool erkennt automatisch alle PII-Daten und ersetzt sie
+2. **KI-Modell herunterladen** – Beim ersten Start über ⚙ Einstellungen das Modell laden (~18 GB, einmalig)
+3. **PDF laden** – Per Drag & Drop oder über „Datei auswählen"
+4. **Modus wählen** – Schwärzen oder Pseudonymisieren
+5. **Speicherort wählen** – Das anonymisierte PDF wird dort abgelegt
+6. **Fertig** – Die lokale KI erkennt automatisch alle personenbezogenen Daten
 
 ## Was wird anonymisiert?
 
-| Kategorie | Beispiel | Variable |
-|---|---|---|
-| Vornamen | Max → | `VBX01` |
-| Nachnamen | Mustermann → | `VBX02` |
-| Straßen | Musterstraße → | `VBX03` |
-| Hausnummern | 42 → | `VBX04` |
-| Städte | Berlin → | `VBX05` |
-| Postleitzahlen | 10115 → | `VBX06` |
-| Kontonummern / IBAN | DE89 3704 ... → | `VBX07` |
-| E-Mail-Adressen | max@example.com → | `VBX08` |
-| Krypto-Adressen | 1A1zP1... → | `VBX09` |
-| Unternehmensnamen | Muster GmbH → | `VBX10` |
-| Grundstücksangaben | Flur 3, Flurstück 42 → | `VBX11` |
-| Telefonnummern | +49 30 12345 → | `VBX12` |
-| Geburtsdaten | 01.01.1990 → | `VBX13` |
-| Steuernummern | DE123456789 → | `VBX14` |
+| Kategorie | Beispiel |
+|---|---|
+| Vornamen | Max → geschwärzt / Thomas |
+| Nachnamen | Mustermann → geschwärzt / Schmidt |
+| Straßen | Musterstraße → geschwärzt / Bahnhofstr. |
+| Hausnummern | 42 → geschwärzt / 17 |
+| Städte | Berlin → geschwärzt / Hamburg |
+| Postleitzahlen | 10115 → geschwärzt / 20095 |
+| Kontonummern / IBAN | DE89 3704 ... → geschwärzt |
+| E-Mail-Adressen | max@example.com → geschwärzt |
+| Unternehmensnamen | Muster GmbH → geschwärzt / Beispiel AG |
+| Telefonnummern | +49 30 12345 → geschwärzt |
+| Geldbeträge | 5.000,00 EUR → geschwärzt |
+| Geburtsdaten | 01.01.1990 → geschwärzt |
+| Steuernummern | DE123456789 → geschwärzt |
+| Aktenzeichen | 5 C 123/24 → geschwärzt |
+| Unterschriften | Handschrift → geschwärzt |
 
-Gleiche Entitäten erhalten immer dieselbe Variable (z. B. „Max" ist überall `VBX01`).
+## Modi
 
-Die anonymisierten Stellen werden **türkis** überdeckt, die Variable wird in weißer Schrift darauf angezeigt.
+- **Schwärzen** – Alle erkannten Daten werden komplett geschwärzt (schwarze Balken)
+- **Pseudonymisieren** – Die KI ersetzt erkannte Daten durch natürlich klingende Alternativen
 
 ## Voraussetzungen
 
-- **Das PDF muss bereits Texterkennung (OCR) enthalten.** Gescannte Bilder ohne eingebetteten Text können nicht verarbeitet werden.
-- Ein gültiger API-Key für mindestens einen der unterstützten KI-Anbieter:
-  - **OpenAI** (ChatGPT) – `sk-...`
-  - **Anthropic** (Claude) – `sk-ant-...`
-  - **Google Gemini** – `AI...`
+- Windows 10/11 oder macOS 12+
+- Mindestens 16 GB RAM
+- ~18 GB freier Speicherplatz für das KI-Modell (Qwen3.5-9B)
+- Kein API-Key nötig – alles läuft lokal
 
-## Installation & Build (Windows EXE)
+## KI-Modell
+
+| | |
+|---|---|
+| **Modell** | Qwen3.5-9B (9 Milliarden Parameter) |
+| **Quelle** | [HuggingFace](https://huggingface.co/Qwen/Qwen3.5-9B) |
+| **Typ** | Sprachmodell, lokal |
+| **Kontext** | 262 000 Tokens |
+| **Download** | ~18 GB (einmalig, wird im HuggingFace-Cache gespeichert) |
+
+## Datenschutz
+
+Alle Daten bleiben auf Ihrem Gerät. Es werden keine Daten an externe Server übertragen. Das KI-Modell läuft vollständig lokal.
+
+## Installation & Build
 
 ### Voraussetzungen
 
@@ -58,25 +74,13 @@ pip install -r requirements.txt
 python src/main.py
 
 # 3. Oder als EXE bauen
-build.bat
-# Ergebnis: dist\PDFAnonymizer\PDFAnonymizer.exe
-```
-
-### Alternativ mit PyInstaller direkt
-
-```bash
-pip install -r requirements.txt
 pyinstaller build.spec
 ```
 
-## Unterstützte KI-Anbieter
+## Unterstützte Eingabeformate
 
-| Anbieter | Modell | Kosten |
-|---|---|---|
-| OpenAI | GPT-4o | nach Verbrauch |
-| Anthropic | Claude Sonnet | nach Verbrauch |
-| Google | Gemini 2.0 Flash | nach Verbrauch |
-
-## Datenschutz
-
-Der Text des PDFs wird an den gewählten KI-Anbieter gesendet, um die personenbezogenen Daten zu erkennen. Stellen Sie sicher, dass dies mit Ihren Datenschutzanforderungen vereinbar ist.
+| Format | Hinweis |
+|---|---|
+| PDF | Direkt verarbeitet, OCR bei Bedarf |
+| DOCX / DOC | Automatisch in PDF konvertiert |
+| JPG / JPEG | Automatisch in PDF konvertiert + OCR |
