@@ -1562,9 +1562,17 @@ def _check_dependencies() -> str | None:
     except ImportError:
         missing.append("PyMuPDF  (pip install PyMuPDF)")
     try:
-        import openai
+        import transformers
     except ImportError:
-        missing.append("openai  (pip install openai)")
+        missing.append("transformers  (pip install transformers)")
+    try:
+        import torch
+    except ImportError:
+        missing.append("torch  (pip install torch)")
+    try:
+        import huggingface_hub
+    except ImportError:
+        missing.append("huggingface_hub  (pip install huggingface_hub)")
     if _import_error is not None and not missing:
         missing.append(str(_import_error))
     # Optional dependencies (warn but don't block)
