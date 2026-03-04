@@ -75,7 +75,7 @@ except ImportError as _imp_err:
     SCOPE_NAMES_ONLY = "names_only"
     SCOPE_ALL = "all"
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".jpg", ".jpeg"}
-    MODEL_DISPLAY_NAME = "Qwen3.5-9B"
+    MODEL_DISPLAY_NAME = "Qwen3-8B"
     def is_model_downloaded(): return False
     def download_model(progress_callback=None): pass
 else:
@@ -796,7 +796,7 @@ class AnonymizeWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ModelDownloadWorker(QThread):
-    """Downloads Qwen3.5-9B from HuggingFace in the background."""
+    """Downloads Qwen3-8B GGUF from HuggingFace in the background."""
 
     progress = pyqtSignal(int)    # -1 = indeterminate, 0-100 = percentage
     status   = pyqtSignal(str)
@@ -858,7 +858,7 @@ class SettingsDialog(QDialog):
         info_layout = QFormLayout(info_box)
         info_layout.setSpacing(8)
         info_layout.addRow(
-            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter)")
+            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (8B Parameter, Q4_K_M)")
         )
         info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
         info_layout.addRow("Typ:", QLabel("Sprachmodell, lokal"))
@@ -1546,13 +1546,10 @@ def _check_dependencies() -> str | None:
     except ImportError:
         missing.append("PyMuPDF  (pip install PyMuPDF)")
 
-    # Heavy ML packages (torch, transformers, huggingface_hub): only check
-    # whether they are *findable* without actually importing them.  A full
-    # ``import torch`` triggers DLL loading which can fail inside a
-    # PyInstaller bundle even though the package is correctly bundled.
+    # llama-cpp-python and huggingface_hub: only check whether they are
+    # *findable* without actually importing them to avoid slow DLL loading.
     for pkg, install_hint in [
-        ("transformers", "transformers  (pip install transformers)"),
-        ("torch", "torch  (pip install torch)"),
+        ("llama_cpp", "llama-cpp-python  (pip install llama-cpp-python)"),
         ("huggingface_hub", "huggingface_hub  (pip install huggingface_hub)"),
     ]:
         if importlib.util.find_spec(pkg) is None:
