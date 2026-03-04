@@ -75,7 +75,7 @@ except ImportError as _imp_err:
     SCOPE_NAMES_ONLY = "names_only"
     SCOPE_ALL = "all"
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".jpg", ".jpeg"}
-    MODEL_DISPLAY_NAME = "Qwen3-8B"
+    MODEL_DISPLAY_NAME = "Qwen3.5-9B"
     def is_model_downloaded(): return False
     def download_model(progress_callback=None): pass
 else:
@@ -796,7 +796,7 @@ class AnonymizeWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ModelDownloadWorker(QThread):
-    """Downloads Qwen3-8B GGUF from HuggingFace in the background."""
+    """Downloads Qwen3.5-9B GGUF from HuggingFace in the background."""
 
     progress = pyqtSignal(int)    # -1 = indeterminate, 0-100 = percentage
     status   = pyqtSignal(str)

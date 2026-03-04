@@ -119,5 +119,21 @@ jobs:
             Dieser Release wird bei jedem Push automatisch aktualisiert.
 
             ---
+
+            ### Was ist neu (v3.0)
+            - **Lokales KI-Modell:** Qwen3.5-9B (GGUF) laeuft direkt auf Ihrem Rechner
+            - **Kleine EXE:** Kein torch/transformers mehr noetig, deutlich kompakter
+            - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
+            - **Datenschutz:** Keine Daten verlassen Ihr Geraet
+
+            ### Erste Schritte
+            1. Programm starten
+            2. Unter Einstellungen das KI-Modell herunterladen (~5 GB, einmalig)
+            3. PDF per Drag & Drop ablegen, Speicherort waehlen, fertig!
+
+            ### Systemanforderungen
+            - Windows 10/11 oder macOS 12+
+            - Mindestens 8 GB RAM (16 GB empfohlen)
+            - ~5 GB freier Speicherplatz fuer das KI-Modell
           files: |
             artifacts/*
