@@ -1535,35 +1535,38 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def _check_dependencies() -> str | None:
+    import importlib.util
+
     missing = []
     optional_missing = []
+
+    # fitz (PyMuPDF) is lightweight – safe to import eagerly
     try:
-        import fitz
+        import fitz  # noqa: F401
     except ImportError:
         missing.append("PyMuPDF  (pip install PyMuPDF)")
-    try:
-        import transformers
-    except ImportError:
-        missing.append("transformers  (pip install transformers)")
-    try:
-        import torch
-    except ImportError:
-        missing.append("torch  (pip install torch)")
-    try:
-        import huggingface_hub
-    except ImportError:
-        missing.append("huggingface_hub  (pip install huggingface_hub)")
+
+    # Heavy ML packages (torch, transformers, huggingface_hub): only check
+    # whether they are *findable* without actually importing them.  A full
+    # ``import torch`` triggers DLL loading which can fail inside a
+    # PyInstaller bundle even though the package is correctly bundled.
+    for pkg, install_hint in [
+        ("transformers", "transformers  (pip install transformers)"),
+        ("torch", "torch  (pip install torch)"),
+        ("huggingface_hub", "huggingface_hub  (pip install huggingface_hub)"),
+    ]:
+        if importlib.util.find_spec(pkg) is None:
+            missing.append(install_hint)
+
     if _import_error is not None and not missing:
         missing.append(str(_import_error))
+
     # Optional dependencies (warn but don't block)
-    try:
-        import ocrmypdf
-    except ImportError:
+    if importlib.util.find_spec("ocrmypdf") is None:
         optional_missing.append("ocrmypdf  (pip install ocrmypdf – für OCR-Unterstützung)")
-    try:
-        import docx
-    except ImportError:
+    if importlib.util.find_spec("docx") is None:
         optional_missing.append("python-docx  (pip install python-docx – für Word-Dateien)")
+
     if missing:
         msg = "Fehlende Abhängigkeiten:\n\n" + "\n".join(f"  •  {m}" for m in missing)
         if optional_missing:
