@@ -102,8 +102,8 @@ jobs:
       - name: Create or update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "PDF Anonymizer - Download"
+          tag_name: v3.1
+          name: "PDF Anonymizer v3.1 – Qwen3.5-9B"
           body: |
             ## PDF Anonymizer – Lokale KI-Anonymisierung
 
@@ -115,21 +115,24 @@ jobs:
 
             ---
 
-            ### Was ist neu (v3.0)
-            - **Lokales KI-Modell:** Qwen3.5-9B (GGUF) laeuft direkt auf Ihrem Rechner
+            ### Was ist neu (v3.1)
+            - **Neues KI-Modell:** Qwen3.5-9B (GGUF Q4_K_M) – neuer, schneller, besser
+            - **Robuster Download:** Fehler beim Modell-Download behoben
+            - **Schnellere Analyse:** Thinking-Modus deaktiviert fuer schnellere Ergebnisse
+            - **Bessere Fehlerbehandlung:** Teilweise Ergebnisse bei grossen Dokumenten
             - **Kleine EXE:** Kein torch/transformers mehr noetig, deutlich kompakter
             - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
             - **Datenschutz:** Keine Daten verlassen Ihr Geraet
 
             ### Erste Schritte
             1. Programm starten
-            2. Unter Einstellungen das KI-Modell herunterladen (~5 GB, einmalig)
+            2. Unter Einstellungen das KI-Modell herunterladen (~6 GB, einmalig)
             3. PDF per Drag & Drop ablegen, Speicherort waehlen, fertig!
 
             ### Systemanforderungen
             - Windows 10/11 oder macOS 12+
             - Mindestens 8 GB RAM (16 GB empfohlen)
-            - ~5 GB freier Speicherplatz fuer das KI-Modell
+            - ~6 GB freier Speicherplatz fuer das KI-Modell
           files: |
             artifacts/*
           draft: false

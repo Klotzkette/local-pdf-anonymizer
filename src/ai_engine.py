@@ -411,6 +411,8 @@ def _run_qwen_inference(
     """Run a single inference call with the local Qwen GGUF model."""
     llm = _load_model()
 
+    # Qwen3.5 has thinking enabled by default; disable it for faster,
+    # deterministic entity extraction (no <think> blocks in output).
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -423,7 +425,10 @@ def _run_qwen_inference(
         top_p=0.9 if temperature > 0.01 else 1.0,
     )
 
-    return response["choices"][0]["message"]["content"] or ""
+    content = response["choices"][0]["message"]["content"] or ""
+    # Strip Qwen3.5 thinking blocks if present
+    content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -549,8 +554,12 @@ def detect_entities(
     for i, chunk in enumerate(chunks):
         if progress_callback:
             progress_callback(int((i / len(chunks)) * 100))
-        chunk_entities = func(api_key, chunk, intensity=intensity, scope=scope)
-        all_entities.extend(chunk_entities)
+        try:
+            chunk_entities = func(api_key, chunk, intensity=intensity, scope=scope)
+            all_entities.extend(chunk_entities)
+        except Exception:
+            # Continue with remaining chunks; partial results are better than none
+            pass
 
     if progress_callback:
         progress_callback(100)

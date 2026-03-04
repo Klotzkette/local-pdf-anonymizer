@@ -1171,7 +1171,7 @@ def _is_legal_numbering(text: str) -> bool:
     return any(p.match(t) for p in _LEGAL_PROTECT_PATTERNS)
 
 
-def _expand_entity_map(entity_map: Dict[str, Tuple[str, str]]):
+def _expand_entity_map(entity_map: Dict[str, Tuple[str, str]]) -> None:
     """Derive additional PII fragments from compound entities.
 
     Mutates *entity_map* in place.  Generates:
