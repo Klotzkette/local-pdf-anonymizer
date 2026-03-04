@@ -1,5 +1,5 @@
 """
-AI Engine – Local Qwen3-8B (GGUF) powered PII entity detection.
+AI Engine – Local Qwen3.5-9B (GGUF) powered PII entity detection.
 
 Uses llama-cpp-python for lightweight inference.  The GGUF model file is
 downloaded from HuggingFace on first use and runs entirely offline
@@ -271,12 +271,12 @@ def _parse_ai_response(response_text: str) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Local Qwen3-8B GGUF model – download, load, inference
+# Local Qwen3.5-9B GGUF model – download, load, inference
 # ---------------------------------------------------------------------------
 
-GGUF_REPO = "Qwen/Qwen3-8B-GGUF"
-GGUF_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
-MODEL_DISPLAY_NAME = "Qwen3-8B (Q4_K_M)"
+GGUF_REPO = "unsloth/Qwen3.5-9B-GGUF"
+GGUF_FILENAME = "Qwen3.5-9B-Q4_K_M.gguf"
+MODEL_DISPLAY_NAME = "Qwen3.5-9B (Q4_K_M)"
 
 # Where we store the downloaded GGUF file
 _MODEL_DIR = Path.home() / ".cache" / "pdf_anonymizer" / "models"
@@ -292,7 +292,7 @@ def is_model_downloaded() -> bool:
 
 
 def download_model(progress_callback=None) -> None:
-    """Download Qwen3-8B GGUF from HuggingFace.
+    """Download Qwen3.5-9B GGUF from HuggingFace.
 
     *progress_callback(pct: int, msg: str)* is called periodically.
     Pass pct=-1 for indeterminate progress.
@@ -355,6 +355,11 @@ def download_model(progress_callback=None) -> None:
         )
     finally:
         download_done.set()
+
+    if downloaded_path is None:
+        raise RuntimeError(
+            "Download fehlgeschlagen: HuggingFace hat keine Datei zurückgegeben."
+        )
 
     # hf_hub_download may place the file in the HF cache; ensure it's at our path
     if not _GGUF_PATH.is_file():
@@ -431,7 +436,7 @@ def detect_entities_qwen(
     intensity: str = INTENSITY_HARD,
     scope: str = SCOPE_ALL,
 ) -> List[Dict[str, str]]:
-    """Detect PII entities using the local Qwen3-8B GGUF model."""
+    """Detect PII entities using the local Qwen3.5-9B GGUF model."""
     user_prompt = _build_user_prompt(text, intensity, scope)
     response = _run_qwen_inference(SYSTEM_PROMPT, user_prompt, temperature=0.0)
     entities = _parse_ai_response(response)
@@ -446,7 +451,7 @@ def generate_natural_replacements_qwen(
     api_key: str,        # unused – kept for API compatibility
     entities: List[Dict[str, str]],
 ) -> Dict[str, str]:
-    """Generate natural-sounding replacements using the local Qwen3-8B GGUF model."""
+    """Generate natural-sounding replacements using the local Qwen3.5-9B GGUF model."""
     items = []
     seen: set = set()
     for ent in entities:

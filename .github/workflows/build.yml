@@ -116,7 +116,7 @@ jobs:
             ---
 
             ### Was ist neu (v3.0)
-            - **Lokales KI-Modell:** Qwen3-8B (GGUF) laeuft direkt auf Ihrem Rechner
+            - **Lokales KI-Modell:** Qwen3.5-9B (GGUF) laeuft direkt auf Ihrem Rechner
             - **Kleine EXE:** Kein torch/transformers mehr noetig, deutlich kompakter
             - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
             - **Datenschutz:** Keine Daten verlassen Ihr Geraet
