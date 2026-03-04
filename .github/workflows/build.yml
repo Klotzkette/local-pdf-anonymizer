@@ -65,6 +65,8 @@ jobs:
         run: brew install cmake
 
       - name: Install dependencies
+              env:
+          CMAKE_ARGS: "-DGGML_METAL=OFF"
         run: pip install -r requirements.txt
 
       - name: Build app with PyInstaller
