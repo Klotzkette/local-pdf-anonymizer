@@ -1,5 +1,5 @@
 """
-PDF Anonymizer – Modern PyQt6 GUI with drag & drop, API key settings,
+PDF Anonymizer – Modern PyQt6 GUI with drag & drop, local AI model management,
 and one-click anonymisation workflow.
 
 Design: Soft blue-teal tones with black accents, Arial font, no bold text.
@@ -75,7 +75,7 @@ except ImportError as _imp_err:
     SCOPE_NAMES_ONLY = "names_only"
     SCOPE_ALL = "all"
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".jpg", ".jpeg"}
-    MODEL_DISPLAY_NAME = "Qwen3.5-9B"
+    MODEL_DISPLAY_NAME = "Qwen3-8B"
     def is_model_downloaded(): return False
     def download_model(progress_callback=None): pass
 else:
@@ -92,26 +92,6 @@ SETTINGS_APP = "toms_super_simple_pdf_anonymizer"
 
 def _settings() -> QSettings:
     return QSettings(SETTINGS_ORG, SETTINGS_APP)
-
-
-def save_api_key(provider: str, key: str):
-    s = _settings()
-    s.setValue(f"api_keys/{provider}", key)
-
-
-def load_api_key(provider: str) -> str:
-    s = _settings()
-    return s.value(f"api_keys/{provider}", "")
-
-
-def save_provider(provider: str):
-    s = _settings()
-    s.setValue("selected_provider", provider)
-
-
-def load_provider() -> str:
-    s = _settings()
-    return s.value("selected_provider", "openai")
 
 
 def save_output_dir(path: str):
@@ -816,7 +796,7 @@ class AnonymizeWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ModelDownloadWorker(QThread):
-    """Downloads Qwen3.5-9B from HuggingFace in the background."""
+    """Downloads Qwen3-8B GGUF from HuggingFace in the background."""
 
     progress = pyqtSignal(int)    # -1 = indeterminate, 0-100 = percentage
     status   = pyqtSignal(str)
@@ -878,10 +858,10 @@ class SettingsDialog(QDialog):
         info_layout = QFormLayout(info_box)
         info_layout.setSpacing(8)
         info_layout.addRow(
-            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter)")
+            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (8B Parameter, Q4_K_M)")
         )
         info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
-        info_layout.addRow("Typ:", QLabel("Vision-Language-Modell, lokal"))
+        info_layout.addRow("Typ:", QLabel("Sprachmodell, lokal"))
         info_layout.addRow(
             "Speicherbedarf:", QLabel("\u223C 18 GB Download  \u00b7  \u223C 16 GB RAM")
         )
@@ -1331,7 +1311,7 @@ class MainWindow(QMainWindow):
         main_layout.addSpacing(2)
 
         # ── Status bar ──
-        self.statusBar().showMessage("Bereit  \u00b7  v2.0")
+        self.statusBar().showMessage("Bereit  \u00b7  v3.0")
         self._update_statusbar_idle()
 
     # -- Helpers --
@@ -1351,11 +1331,11 @@ class MainWindow(QMainWindow):
     def _update_statusbar_idle(self):
         if is_model_downloaded():
             self.statusBar().showMessage(
-                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v2.0"
+                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.0"
             )
         else:
             self.statusBar().showMessage(
-                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v2.0"
+                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.0"
             )
 
     def _current_mode(self) -> str:
@@ -1555,35 +1535,35 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def _check_dependencies() -> str | None:
+    import importlib.util
+
     missing = []
     optional_missing = []
+
+    # fitz (PyMuPDF) is lightweight – safe to import eagerly
     try:
-        import fitz
+        import fitz  # noqa: F401
     except ImportError:
         missing.append("PyMuPDF  (pip install PyMuPDF)")
-    try:
-        import transformers
-    except ImportError:
-        missing.append("transformers  (pip install transformers)")
-    try:
-        import torch
-    except ImportError:
-        missing.append("torch  (pip install torch)")
-    try:
-        import huggingface_hub
-    except ImportError:
-        missing.append("huggingface_hub  (pip install huggingface_hub)")
+
+    # llama-cpp-python and huggingface_hub: only check whether they are
+    # *findable* without actually importing them to avoid slow DLL loading.
+    for pkg, install_hint in [
+        ("llama_cpp", "llama-cpp-python  (pip install llama-cpp-python)"),
+        ("huggingface_hub", "huggingface_hub  (pip install huggingface_hub)"),
+    ]:
+        if importlib.util.find_spec(pkg) is None:
+            missing.append(install_hint)
+
     if _import_error is not None and not missing:
         missing.append(str(_import_error))
+
     # Optional dependencies (warn but don't block)
-    try:
-        import ocrmypdf
-    except ImportError:
+    if importlib.util.find_spec("ocrmypdf") is None:
         optional_missing.append("ocrmypdf  (pip install ocrmypdf – für OCR-Unterstützung)")
-    try:
-        import docx
-    except ImportError:
+    if importlib.util.find_spec("docx") is None:
         optional_missing.append("python-docx  (pip install python-docx – für Word-Dateien)")
+
     if missing:
         msg = "Fehlende Abhängigkeiten:\n\n" + "\n".join(f"  •  {m}" for m in missing)
         if optional_missing:

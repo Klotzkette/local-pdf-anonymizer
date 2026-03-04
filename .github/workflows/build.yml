@@ -29,19 +29,24 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller --noconfirm --clean --name PDFAnonymizer --windowed --onefile --add-data "src;src" src/main.py
+        run: pyinstaller build.spec --noconfirm --clean
 
       - name: Verify build output
         run: |
-          dir dist\
-          dir dist\PDFAnonymizer.exe
+          dir dist\toms_super_simple_pdf_anonymizer\
+          dir dist\toms_super_simple_pdf_anonymizer\toms_super_simple_pdf_anonymizer.exe
+
+      - name: Create ZIP for distribution
+        run: |
+          cd dist
+          Compress-Archive -Path toms_super_simple_pdf_anonymizer -DestinationPath PDFAnonymizer-Windows.zip
+        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: PDFAnonymizer-Windows
-          path: dist/PDFAnonymizer.exe
+          path: dist/PDFAnonymizer-Windows.zip
 
   build-macos:
     runs-on: macos-latest
@@ -56,16 +61,18 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      - name: Install build tools
+        run: brew install cmake
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Build app with PyInstaller
-        run: |
-          pyinstaller --noconfirm --clean --name PDFAnonymizer --windowed --onefile --add-data "src:src" src/main.py
+        run: pyinstaller build.spec --noconfirm --clean
 
       - name: Create ZIP for distribution
         run: |
-          cd dist && zip -r PDFAnonymizer-Mac.zip PDFAnonymizer
+          cd dist && zip -r PDFAnonymizer-Mac.zip toms_super_simple_pdf_anonymizer
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -75,6 +82,7 @@ jobs:
 
   release:
     needs: [build-windows, build-macos]
+    if: always() && needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
@@ -85,6 +93,7 @@ jobs:
           path: artifacts/
 
       - name: Download Mac artifact
+        if: needs.build-macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: PDFAnonymizer-Mac
@@ -99,7 +108,7 @@ jobs:
             ## PDF Anonymizer – Lokale KI-Anonymisierung
 
             **Downloads:**
-            - **Windows:** `PDFAnonymizer.exe` herunterladen und starten
+            - **Windows:** `PDFAnonymizer-Windows.zip` herunterladen, entpacken und starten
             - **Mac:** `PDFAnonymizer-Mac.zip` herunterladen, entpacken und starten
 
             Dieser Release wird bei jedem Push automatisch aktualisiert.
@@ -107,22 +116,22 @@ jobs:
             ---
 
             ### Was ist neu (v3.0)
-            - **Lokales KI-Modell:** Qwen3.5-9B laeuft direkt auf Ihrem Rechner
+            - **Lokales KI-Modell:** Qwen3-8B (GGUF) laeuft direkt auf Ihrem Rechner
+            - **Kleine EXE:** Kein torch/transformers mehr noetig, deutlich kompakter
             - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
             - **Datenschutz:** Keine Daten verlassen Ihr Geraet
 
             ### Erste Schritte
             1. Programm starten
-            2. Unter Einstellungen das KI-Modell herunterladen (~18 GB, einmalig)
+            2. Unter Einstellungen das KI-Modell herunterladen (~5 GB, einmalig)
             3. PDF per Drag & Drop ablegen, Speicherort waehlen, fertig!
 
             ### Systemanforderungen
             - Windows 10/11 oder macOS 12+
-            - Mindestens 16 GB RAM
-            - ~18 GB freier Speicherplatz fuer das KI-Modell
+            - Mindestens 8 GB RAM (16 GB empfohlen)
+            - ~5 GB freier Speicherplatz fuer das KI-Modell
           files: |
-            artifacts/PDFAnonymizer.exe
-            artifacts/PDFAnonymizer-Mac.zip
+            artifacts/*
           draft: false
           prerelease: false
           make_latest: true
