@@ -66,8 +66,10 @@ jobs:
 
       - name: Install dependencies
         env:
-          CMAKE_ARGS: "-DGGML_METAL=OFF"
-        run: pip install -r requirements.txt
+          CMAKE_ARGS: "-DGGML_METAL=OFF -DGGML_ACCELERATE=OFF -DGGML_BLAS=OFF"
+          FORCE_CMAKE: "1"
+        run: |
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Build app with PyInstaller
         run: pyinstaller build.spec --noconfirm --clean
