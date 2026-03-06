@@ -1312,7 +1312,7 @@ class MainWindow(QMainWindow):
         main_layout.addSpacing(2)
 
         # ── Status bar ──
-        self.statusBar().showMessage("Bereit  \u00b7  v3.0")
+        self.statusBar().showMessage("Bereit  \u00b7  v3.1")
         self._update_statusbar_idle()
 
     # -- Helpers --
@@ -1332,11 +1332,11 @@ class MainWindow(QMainWindow):
     def _update_statusbar_idle(self):
         if is_model_downloaded():
             self.statusBar().showMessage(
-                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.0"
+                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.1"
             )
         else:
             self.statusBar().showMessage(
-                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.0"
+                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.1"
             )
 
     def _current_mode(self) -> str:

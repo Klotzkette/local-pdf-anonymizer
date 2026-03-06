@@ -394,14 +394,16 @@ def _load_model():
             "Bitte zuerst das Modell herunterladen."
         )
 
-    # Detect GPU layers: use all layers on GPU if available, else CPU only
-    n_gpu = -1  # offload all layers to GPU if possible
+    # Detect GPU layers: use all layers on GPU if available, else CPU only.
+    # llama_supports_gpu_offload() can crash with an access violation
+    # (OSError) in CPU-only PyInstaller builds where the GPU symbol is null.
+    n_gpu = 0  # default: CPU-only (safe)
     try:
         from llama_cpp import llama_supports_gpu_offload
-        if not llama_supports_gpu_offload():
-            n_gpu = 0
-    except ImportError:
-        n_gpu = 0  # CPU-only build of llama-cpp-python
+        if llama_supports_gpu_offload():
+            n_gpu = -1  # offload all layers to GPU
+    except (ImportError, OSError, Exception):
+        pass  # any failure → stay on CPU
 
     _llm = Llama(
         model_path=str(_GGUF_PATH),
