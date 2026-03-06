@@ -12,6 +12,7 @@ import sys
 import json
 import traceback
 from pathlib import Path
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -683,7 +684,7 @@ class AnonymizeWorker(QThread):
         self.api_key = api_key
         self.mode = mode
         self.scope = scope
-        self._temp_pdf: str | None = None
+        self._temp_pdf: Optional[str] = None
 
     def run(self):
         try:
@@ -858,12 +859,12 @@ class SettingsDialog(QDialog):
         info_layout = QFormLayout(info_box)
         info_layout.setSpacing(8)
         info_layout.addRow(
-            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (8B Parameter, Q4_K_M)")
+            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter, Q4_K_M)")
         )
         info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
         info_layout.addRow("Typ:", QLabel("Sprachmodell, lokal"))
         info_layout.addRow(
-            "Speicherbedarf:", QLabel("\u223C 18 GB Download  \u00b7  \u223C 16 GB RAM")
+            "Speicherbedarf:", QLabel("\u223C 6 GB Download  \u00b7  \u223C 8 GB RAM")
         )
         layout.addWidget(info_box)
 
@@ -1072,7 +1073,7 @@ class ModeSelectionDialog(QDialog):
         self.setWindowTitle("Verarbeitungsoptionen")
         self.setFixedWidth(500)
         self.setStyleSheet(STYLESHEET)
-        self.selected_mode: str | None = None
+        self.selected_mode: Optional[str] = None
         self.selected_scope: str = load_scope()
 
         layout = QVBoxLayout(self)
@@ -1226,8 +1227,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
 
         self.worker = None
-        self.current_pdf: str | None = None
-        self._last_output: str | None = None
+        self.current_pdf: Optional[str] = None
+        self._last_output: Optional[str] = None
         self._entity_count = 0
         self._selected_mode: str = MODE_ANONYMIZE
 
@@ -1534,7 +1535,7 @@ class MainWindow(QMainWindow):
 # Dependency check & entry point
 # ---------------------------------------------------------------------------
 
-def _check_dependencies() -> str | None:
+def _check_dependencies() -> Optional[str]:
     import importlib.util
 
     missing = []

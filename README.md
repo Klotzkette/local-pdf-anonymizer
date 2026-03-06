@@ -5,7 +5,7 @@ KI-gestütztes Tool zur automatischen Anonymisierung personenbezogener Daten in 
 ## Funktionsweise
 
 1. **Programm starten** – `PDFAnonymizer.exe` (Windows) oder `python src/main.py`
-2. **KI-Modell herunterladen** – Beim ersten Start über ⚙ Einstellungen das Modell laden (~18 GB, einmalig)
+2. **KI-Modell herunterladen** – Beim ersten Start über ⚙ Einstellungen das Modell laden (~6 GB, einmalig)
 3. **PDF laden** – Per Drag & Drop oder über „Datei auswählen"
 4. **Modus wählen** – Schwärzen oder Pseudonymisieren
 5. **Speicherort wählen** – Das anonymisierte PDF wird dort abgelegt
@@ -40,7 +40,7 @@ KI-gestütztes Tool zur automatischen Anonymisierung personenbezogener Daten in 
 
 - Windows 10/11 oder macOS 12+
 - Mindestens 16 GB RAM
-- ~18 GB freier Speicherplatz für das KI-Modell (Qwen3.5-9B)
+- ~6 GB freier Speicherplatz für das KI-Modell (Qwen3.5-9B)
 - Kein API-Key nötig – alles läuft lokal
 
 ## KI-Modell
@@ -48,10 +48,10 @@ KI-gestütztes Tool zur automatischen Anonymisierung personenbezogener Daten in 
 | | |
 |---|---|
 | **Modell** | Qwen3.5-9B (9 Milliarden Parameter) |
-| **Quelle** | [HuggingFace](https://huggingface.co/Qwen/Qwen3.5-9B) |
-| **Typ** | Sprachmodell, lokal |
+| **Quelle** | [HuggingFace](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
+| **Typ** | Sprachmodell, lokal (GGUF Q4_K_M) |
 | **Kontext** | 262 000 Tokens |
-| **Download** | ~18 GB (einmalig, wird im HuggingFace-Cache gespeichert) |
+| **Download** | ~6 GB (einmalig, wird lokal gespeichert) |
 
 ## Datenschutz
 
