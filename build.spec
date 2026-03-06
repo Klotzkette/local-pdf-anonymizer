@@ -5,14 +5,30 @@ Usage:  pyinstaller build.spec
 """
 
 import sys
+import importlib
 from pathlib import Path
 
 block_cipher = None
 
+# llama-cpp-python stores its native libs (.dll/.so/.dylib) in a 'lib/'
+# subdirectory next to its Python files.  PyInstaller doesn't detect these
+# automatically, so we must collect them explicitly.
+_llama_cpp_libs = []
+try:
+    _llama_pkg = Path(importlib.import_module('llama_cpp').__file__).parent
+    _llama_lib_dir = _llama_pkg / 'lib'
+    if _llama_lib_dir.is_dir():
+        for f in _llama_lib_dir.iterdir():
+            if f.suffix in ('.dll', '.so', '.dylib') or '.so.' in f.name:
+                # (source_path, dest_dir_inside_bundle)
+                _llama_cpp_libs.append((str(f), str(Path('llama_cpp') / 'lib')))
+except Exception:
+    pass
+
 a = Analysis(
     ['src/main.py'],
     pathex=[],
-    binaries=[],
+    binaries=_llama_cpp_libs,
     datas=[],
     hiddenimports=[
         'llama_cpp',
