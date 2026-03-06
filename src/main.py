@@ -7,6 +7,15 @@ Starts the PyQt6 GUI application for AI-powered PDF anonymisation.
 import sys
 import os
 
+# PyInstaller with console=False sets sys.stdout/stderr to None.
+# Libraries like huggingface_hub/tqdm call sys.stderr.write() internally,
+# which crashes with "'NoneType' object has no attribute 'write'".
+# Redirect to devnull to prevent this.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 # Ensure the src directory is on the path (needed for PyInstaller bundles).
 # When frozen (--onefile / --onedir) the modules live inside _MEIPASS/src;
 # when running from source they sit next to this file.
