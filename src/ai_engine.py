@@ -297,6 +297,7 @@ def download_model(progress_callback=None) -> None:
     *progress_callback(pct: int, msg: str)* is called periodically.
     Pass pct=-1 for indeterminate progress.
     """
+    import shutil
     from huggingface_hub import hf_hub_download, HfApi
 
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -325,9 +326,15 @@ def download_model(progress_callback=None) -> None:
                 hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
                 current = 0
                 for p in hf_cache.rglob("*.incomplete"):
-                    current = max(current, p.stat().st_size)
+                    try:
+                        current = max(current, p.stat().st_size)
+                    except OSError:
+                        pass
                 if current == 0 and _GGUF_PATH.exists():
-                    current = _GGUF_PATH.stat().st_size
+                    try:
+                        current = _GGUF_PATH.stat().st_size
+                    except OSError:
+                        pass
                 if total_bytes > 0 and current > 0:
                     pct = min(95, int(current * 100 / total_bytes))
                     msg = (
@@ -348,23 +355,26 @@ def download_model(progress_callback=None) -> None:
     monitor_thread.start()
 
     try:
-        downloaded_path = hf_hub_download(
+        # Download to HF's default cache (robust, supports resume).
+        # Do NOT use local_dir= as it causes 'NoneType' write errors
+        # in PyInstaller environments due to symlink/file handle issues.
+        cached_path = hf_hub_download(
             repo_id=GGUF_REPO,
             filename=GGUF_FILENAME,
-            local_dir=str(_MODEL_DIR),
         )
     finally:
         download_done.set()
 
-    if downloaded_path is None:
+    if cached_path is None:
         raise RuntimeError(
             "Download fehlgeschlagen: HuggingFace hat keine Datei zurückgegeben."
         )
 
-    # hf_hub_download may place the file in the HF cache; ensure it's at our path
+    # Copy from HF cache to our model directory
     if not _GGUF_PATH.is_file():
-        import shutil
-        shutil.copy2(downloaded_path, _GGUF_PATH)
+        if progress_callback:
+            progress_callback(96, "Kopiere Modell …")
+        shutil.copy2(cached_path, _GGUF_PATH)
 
     if progress_callback:
         progress_callback(100, "Download abgeschlossen")
