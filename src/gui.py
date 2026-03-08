@@ -67,6 +67,7 @@ try:
         INTENSITY_HARD,
         SCOPE_NAMES_ONLY, SCOPE_ALL,
         is_model_downloaded, download_model,
+        is_model_loaded, preload_model, wait_for_preload,
         MODEL_DISPLAY_NAME,
     )
     from pdf_processor import (
@@ -85,6 +86,9 @@ except ImportError as _imp_err:
     MODEL_DISPLAY_NAME = "Qwen3.5-9B"
     def is_model_downloaded(): return False
     def download_model(progress_callback=None): pass
+    def is_model_loaded(): return False
+    def preload_model(): pass
+    def wait_for_preload(timeout=120.0): return False
 else:
     _import_error = None
 
@@ -697,13 +701,17 @@ class AnonymizeWorker(QThread):
         use_regex_fallback = False
 
         try:
-            # Step 0 – load model into memory (first call takes a while)
+            # Step 0 – ensure model is in RAM (instant if preloaded at startup)
             self.step.emit("Modell laden …")
-            self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) wird in den Speicher geladen …")
             self.progress.emit(1)
 
             try:
-                from ai_engine import _load_model
+                from ai_engine import _load_model, is_model_loaded, wait_for_preload
+                if is_model_loaded():
+                    self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) bereit")
+                else:
+                    self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) wird in den Speicher geladen …")
+                    wait_for_preload(timeout=120.0)
                 model = _load_model()
                 if model is None:
                     logger.warning("Modell konnte nicht geladen werden, "
@@ -1032,6 +1040,8 @@ class SettingsDialog(QDialog):
         self._progress_bar.setValue(100)
         self._close_btn.setEnabled(True)
         self._refresh_status()
+        # Immediately start preloading the model into RAM
+        preload_model()
         self.model_status_changed.emit()
 
     def _on_dl_err(self, msg: str):
@@ -1384,14 +1394,39 @@ class MainWindow(QMainWindow):
         main_layout.addSpacing(2)
 
         # ── Status bar ──
-        self.statusBar().showMessage("Bereit  \u00b7  v3.1")
+        self.statusBar().showMessage("Bereit  \u00b7  v3.2")
         self._update_statusbar_idle()
+
+        # ── Background model preload ──
+        # If model is downloaded, start loading it into RAM immediately
+        # so it's ready when the user drops a file.
+        if is_model_downloaded() and not is_model_loaded():
+            preload_model()
+            # Poll until model is loaded, then update the UI
+            self._preload_timer = QTimer(self)
+            self._preload_timer.setInterval(1000)
+            self._preload_timer.timeout.connect(self._check_preload)
+            self._preload_timer.start()
+
+    def _check_preload(self):
+        """Called by timer to update UI once background preload finishes."""
+        if is_model_loaded():
+            self._preload_timer.stop()
+            self._update_provider_pill()
+            self._update_statusbar_idle()
 
     # -- Helpers --
 
     def _update_provider_pill(self):
-        if is_model_downloaded():
-            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Lokal")
+        if is_model_loaded():
+            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Bereit")
+            self.provider_pill.setStyleSheet(
+                f"color: {SUCCESS}; background-color: {SUCCESS_BG}; "
+                f"border: 1px solid {SUCCESS_BORDER}; "
+                f"border-radius: 14px; padding: 4px 12px; font-size: 11px;"
+            )
+        elif is_model_downloaded():
+            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Wird geladen \u2026")
             self.provider_pill.setStyleSheet("")  # default stylesheet
         else:
             self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  nicht geladen")
@@ -1402,13 +1437,17 @@ class MainWindow(QMainWindow):
             )
 
     def _update_statusbar_idle(self):
-        if is_model_downloaded():
+        if is_model_loaded():
             self.statusBar().showMessage(
-                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} geladen  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.1"
+                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} im RAM  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.2"
+            )
+        elif is_model_downloaded():
+            self.statusBar().showMessage(
+                f"Modell wird geladen \u2026  \u00b7  {MODEL_DISPLAY_NAME}  \u00b7  v3.2"
             )
         else:
             self.statusBar().showMessage(
-                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.1"
+                f"KI-Modell nicht geladen  \u00b7  Bitte unter \u2699 Einstellungen herunterladen  \u00b7  v3.2"
             )
 
     def _current_mode(self) -> str:
