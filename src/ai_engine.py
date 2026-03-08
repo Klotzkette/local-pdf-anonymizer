@@ -521,6 +521,52 @@ def _optimal_threads() -> int:
     return phys
 
 
+def _warm_page_cache(path: Path) -> None:
+    """Read the entire file sequentially to pull it into the OS page cache.
+
+    This is much faster than mlock because:
+    - It uses large sequential reads (the OS prefetcher helps)
+    - It runs before the Llama constructor, so by the time mmap maps
+      the file, the pages are already resident in RAM
+    - On Linux, posix_fadvise WILLNEED triggers async readahead
+    """
+    file_size = path.stat().st_size
+    t0 = time.monotonic()
+
+    # Try posix_fadvise first (Linux) – non-blocking async readahead
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_WILLNEED)
+            logger.info("posix_fadvise WILLNEED gesetzt für %.1f GB",
+                        file_size / 1e9)
+        finally:
+            os.close(fd)
+    except (AttributeError, OSError):
+        pass  # Not Linux or fadvise unavailable
+
+    # Sequential read in large chunks to ensure pages are resident.
+    # 4MB chunks maximize throughput on SSDs and HDDs alike.
+    CHUNK = 4 * 1024 * 1024
+    read_bytes = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(CHUNK)
+                if not data:
+                    break
+                read_bytes += len(data)
+    except OSError as e:
+        logger.warning("Page-Cache-Warming fehlgeschlagen: %s", e)
+        return
+
+    elapsed = time.monotonic() - t0
+    speed = (read_bytes / 1e9) / elapsed if elapsed > 0 else 0
+    logger.info("Page-Cache-Warming: %.1f GB in %.1f s (%.1f GB/s)",
+                read_bytes / 1e9, elapsed, speed)
+
+
 def _load_model():
     """Load the GGUF model via llama-cpp-python (cached globally).
 
@@ -555,6 +601,11 @@ def _load_model():
         t0 = time.monotonic()
         logger.info("Lade Modell: %s", model_path)
 
+        # Phase 1: Pull entire file into OS page cache BEFORE llama.cpp
+        # touches it. This makes the subsequent mmap near-instant because
+        # all pages are already resident.
+        _warm_page_cache(model_path)
+
         # Force-disable GPU backends via environment BEFORE importing llama_cpp
         # so that llama.cpp's internal backend init never touches GPU drivers.
         os.environ["GGML_CUDA"] = "0"
@@ -580,6 +631,9 @@ def _load_model():
             except (ImportError, OSError, Exception):
                 logger.info("Kein GPU-Offload, verwende CPU")
 
+            # Phase 2: Load model. use_mlock=False because page cache warming
+            # already made all pages resident; mlock would just slow things
+            # down by forcing synchronous page faults.
             try:
                 _llm = Llama(
                     model_path=str(model_path),
@@ -587,14 +641,14 @@ def _load_model():
                     n_gpu_layers=n_gpu,
                     n_threads=n_threads,
                     n_threads_batch=n_threads,
-                    flash_attn=False,
+                    flash_attn=True,
                     verbose=False,
                     use_mmap=True,
-                    use_mlock=True,
+                    use_mlock=False,
                 )
-            except OSError:
-                logger.warning("Modell-Laden mit n_ctx=16384/mlock fehlgeschlagen, "
-                               "versuche n_ctx=8192 ohne mlock", exc_info=True)
+            except (OSError, Exception) as first_err:
+                logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
+                               "versuche n_ctx=8192", first_err, exc_info=True)
                 _llm = Llama(
                     model_path=str(model_path),
                     n_ctx=8192,
