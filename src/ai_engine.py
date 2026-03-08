@@ -380,13 +380,41 @@ def download_model(progress_callback=None) -> None:
         progress_callback(100, "Download abgeschlossen")
 
 
+def _safe_backend_init():
+    """Initialise llama.cpp backends, swallowing GPU-related crashes.
+
+    On CPU-only PyInstaller builds the GPU backend symbols can be null
+    pointers which causes an access-violation (OSError) inside
+    ``llama_backend_init()``.  We call it ourselves inside a try/except
+    and then mark the Llama class as already initialised so that the
+    constructor does not attempt it again.
+    """
+    import llama_cpp as _lc
+    from llama_cpp import Llama
+
+    if getattr(Llama, "_Llama__backend_initialized", False):
+        return  # already done
+
+    try:
+        _lc.llama_backend_init()
+    except (OSError, Exception):
+        # Backend init (partially) failed – CPU backend is typically
+        # still usable even when GPU init crashes.
+        pass
+
+    # Tell Llama that backend_init was already called so it won't
+    # call it again and crash in its constructor.
+    try:
+        Llama._Llama__backend_initialized = True
+    except AttributeError:
+        pass  # internal API changed – the constructor will try itself
+
+
 def _load_model():
     """Load the GGUF model via llama-cpp-python (cached globally)."""
     global _llm
     if _llm is not None:
         return _llm
-
-    from llama_cpp import Llama
 
     if not _GGUF_PATH.is_file():
         raise FileNotFoundError(
@@ -394,47 +422,45 @@ def _load_model():
             "Bitte zuerst das Modell herunterladen."
         )
 
-    # Detect GPU layers: use all layers on GPU if available, else CPU only.
-    # llama_supports_gpu_offload() can crash with an access violation
-    # (OSError) in CPU-only PyInstaller builds where the GPU symbol is null.
-    n_gpu = 0  # default: CPU-only (safe)
+    # Force-disable GPU backends via environment BEFORE importing llama_cpp
+    # so that llama.cpp's internal backend init never touches GPU drivers.
+    os.environ["GGML_CUDA"] = "0"
+    os.environ["GGML_VULKAN"] = "0"
+    os.environ["GGML_METAL"] = "0"
+
+    # Safe backend init: catches access violations from GPU probing
+    _safe_backend_init()
+
+    from llama_cpp import Llama
+
+    # Detect GPU: only try if env vars weren't forced above
+    n_gpu = 0
     try:
         from llama_cpp import llama_supports_gpu_offload
         if llama_supports_gpu_offload():
-            n_gpu = -1  # offload all layers to GPU
+            n_gpu = -1
     except (ImportError, OSError, Exception):
-        pass  # any failure → stay on CPU
+        pass
 
-    # Force-disable GPU backends via environment so that llama.cpp's
-    # internal backend init never touches GPU drivers.  This prevents
-    # access-violation crashes in PyInstaller bundles where the CUDA/
-    # Vulkan/Metal shared libraries are absent or incompatible.
-    if n_gpu == 0:
-        os.environ.setdefault("GGML_CUDA", "0")
-        os.environ.setdefault("GGML_VULKAN", "0")
-        os.environ.setdefault("GGML_METAL", "0")
-
-    # The Llama constructor can itself trigger an access violation on
-    # CPU-only PyInstaller builds even with n_gpu_layers=0.  If that
-    # happens, retry once with n_gpu forced to 0.
-    for attempt in range(2):
-        try:
-            _llm = Llama(
-                model_path=str(_GGUF_PATH),
-                n_ctx=32768,
-                n_gpu_layers=n_gpu,
-                flash_attn=False,
-                verbose=False,
-            )
-            return _llm
-        except OSError:
-            if attempt == 0:
-                n_gpu = 0
-                os.environ["GGML_CUDA"] = "0"
-                os.environ["GGML_VULKAN"] = "0"
-                os.environ["GGML_METAL"] = "0"
-                continue
-            raise
+    try:
+        _llm = Llama(
+            model_path=str(_GGUF_PATH),
+            n_ctx=32768,
+            n_gpu_layers=n_gpu,
+            flash_attn=False,
+            verbose=False,
+        )
+        return _llm
+    except OSError:
+        # Last resort: smaller context, definitely no GPU
+        _llm = Llama(
+            model_path=str(_GGUF_PATH),
+            n_ctx=8192,
+            n_gpu_layers=0,
+            flash_attn=False,
+            verbose=False,
+        )
+        return _llm
 
 
 def _run_qwen_inference(
