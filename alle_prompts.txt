@@ -1,14 +1,14 @@
 ================================================================================
-ALLE GPT-PROMPTS IM PDF-ANONYMISIERUNGSTOOL
+ALLE KI-PROMPTS IM PDF-ANONYMISIERUNGSTOOL
 ================================================================================
 Datei: src/ai_engine.py  und  src/pdf_processor.py
-Modell: GPT-5.2  /  GPT-5.2 Vision
+Modell: Qwen3.5-9B  /  Qwen3.5-9B Vision
 ================================================================================
 
 
 ################################################################################
 # PROMPT 1: SYSTEM-PROMPT – PII-Erkennung  (ai_engine.py, SYSTEM_PROMPT)
-# Wird als "system" message an GPT-5.2 gesendet
+# Wird als "system" message an Qwen3.5-9B gesendet
 ################################################################################
 
 Du bist ein präziser Experte für Datenanonymisierung. Deine Aufgabe ist es, in einem gegebenen Text ALLE personenbezogenen und identifizierenden Daten LÜCKENLOS zu finden.
@@ -178,7 +178,7 @@ Entitäten:
 
 ################################################################################
 # PROMPT 7: VISION OCR-PROMPT  (pdf_processor.py, _VISION_OCR_PROMPT)
-# Wird mit GPT-5.2 Vision gesendet, um Text aus gescannten PDF-Seiten zu lesen
+# Wird mit Qwen3.5-9B Vision gesendet, um Text aus gescannten PDF-Seiten zu lesen
 ################################################################################
 
 Extrahiere den VOLLSTÄNDIGEN Text aus diesem Dokument-Scan / Bild.
@@ -197,7 +197,7 @@ REGELN:
 
 ################################################################################
 # PROMPT 8: VISION SIGNATURE-PROMPT  (pdf_processor.py, _VISION_PROMPT)
-# Wird mit GPT-5.2 Vision gesendet, um Unterschriften/Logos/Stempel zu finden
+# Wird mit Qwen3.5-9B Vision gesendet, um Unterschriften/Logos/Stempel zu finden
 ################################################################################
 
 Du bist ein forensischer Dokumentenprüfer für Datenschutz-Anonymisierung.
