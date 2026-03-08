@@ -22,11 +22,15 @@ Key features:
 
 import fitz  # PyMuPDF
 from typing import Dict, Tuple, List, Optional, Callable
+import logging
 import os
 import json as _json
 import re as _re
+import shutil
 import subprocess
 import tempfile
+
+logger = logging.getLogger("pdf_anonymizer")
 
 
 # ─── Redaction colour palette ───────────────────────────────────────────────
@@ -52,14 +56,20 @@ _GENERIC_SUFFIXES = {
 
 def _has_text_layer(pdf_path: str) -> bool:
     """Check if a PDF has an extractable text layer."""
-    doc = fitz.open(pdf_path)
-    for page in doc:
-        text = page.get_text("text")
-        if text.strip():
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            for page in doc:
+                text = page.get_text("text")
+                if text.strip():
+                    return True
+            return False
+        finally:
             doc.close()
-            return True
-    doc.close()
-    return False
+    except Exception:
+        logger.warning("Konnte PDF nicht auf Textlayer prüfen: %s", pdf_path,
+                       exc_info=True)
+        return False
 
 
 def _image_to_pdf(img_path: str) -> str:
@@ -67,17 +77,27 @@ def _image_to_pdf(img_path: str) -> str:
 
     Returns the path to a temporary PDF file.
     """
+    tmp_path = None
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp_path = tmp.name
         tmp.close()
         img_doc = fitz.open(img_path)
         pdf_bytes = img_doc.convert_to_pdf()
         img_doc.close()
         pdf_doc = fitz.open("pdf", pdf_bytes)
-        pdf_doc.save(tmp.name)
+        pdf_doc.save(tmp_path)
         pdf_doc.close()
-        return tmp.name
+        logger.info("Bild zu PDF konvertiert: %s", img_path)
+        return tmp_path
     except Exception as e:
+        # Clean up temp file on failure
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        logger.error("Bild-zu-PDF Konvertierung fehlgeschlagen: %s", e)
         raise RuntimeError(
             f"Fehler beim Konvertieren des Bildes in PDF: {e}\n"
             f"Stellen Sie sicher, dass die Datei ein gültiges JPG/JPEG ist."
@@ -91,20 +111,31 @@ def _ocr_pdf(pdf_path: str) -> str:
     Returns the path to the OCR'd temporary PDF.
     """
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp_path = tmp.name
     tmp.close()
+
+    def _cleanup_tmp():
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
     try:
         import ocrmypdf
         ocrmypdf.ocr(
-            pdf_path, tmp.name,
+            pdf_path, tmp_path,
             language="deu+eng",
             skip_text=True,
             optimize=1,
             progress_bar=False,
         )
-        return tmp.name
+        logger.info("OCR (Python-API) erfolgreich: %s", pdf_path)
+        return tmp_path
     except ImportError:
         pass  # try CLI fallback below
     except Exception as e:
+        _cleanup_tmp()
+        logger.error("OCR (Python-API) fehlgeschlagen: %s", e)
         raise RuntimeError(f"OCR-Fehler: {e}")
 
     # Fallback: command-line ocrmypdf (needs tesseract installed)
@@ -112,24 +143,31 @@ def _ocr_pdf(pdf_path: str) -> str:
         subprocess.run(
             [
                 "ocrmypdf", "--skip-text", "-l", "deu+eng",
-                "--optimize", "1", pdf_path, tmp.name,
+                "--optimize", "1", pdf_path, tmp_path,
             ],
             check=True,
             timeout=300,
         )
-        return tmp.name
+        logger.info("OCR (CLI) erfolgreich: %s", pdf_path)
+        return tmp_path
     except FileNotFoundError:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        _cleanup_tmp()
         raise RuntimeError(
             "OCR wird benötigt, ist aber nicht installiert.\n"
             "Bitte installieren Sie ocrmypdf und Tesseract:\n"
             "  • pip install ocrmypdf\n"
             "  • Tesseract: apt install tesseract-ocr tesseract-ocr-deu"
         )
+    except subprocess.TimeoutExpired:
+        _cleanup_tmp()
+        logger.error("OCR-Timeout nach 300 Sekunden: %s", pdf_path)
+        raise RuntimeError(
+            "Die Texterkennung (OCR) hat zu lange gedauert (>5 Minuten).\n"
+            "Das PDF ist möglicherweise zu groß oder beschädigt."
+        )
     except subprocess.SubprocessError as e:
+        _cleanup_tmp()
+        logger.error("OCR (CLI) fehlgeschlagen: %s", e)
         raise RuntimeError(f"OCR-Fehler: {e}")
 
 
@@ -230,7 +268,11 @@ def _docx_to_pdf(docx_path: str) -> str:
                 stderr=subprocess.DEVNULL,
             )
             if os.path.exists(expected):
+                logger.info("DOCX-zu-PDF via LibreOffice: %s", docx_path)
                 return expected
+        except subprocess.TimeoutExpired:
+            logger.warning("LibreOffice-Timeout nach 120s für: %s", docx_path)
+            continue
         except (FileNotFoundError, subprocess.SubprocessError):
             continue
 
@@ -269,6 +311,32 @@ def _do_ocr(pdf_path: str, api_key: Optional[str] = None,
     return _ocr_pdf(pdf_path)
 
 
+def validate_input_file(input_path: str) -> None:
+    """Validate that the input file exists, is readable, and has content."""
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(
+            f"Datei nicht gefunden: {input_path}"
+        )
+    if not os.path.isfile(input_path):
+        raise ValueError(
+            f"Kein gültiger Dateipfad: {input_path}"
+        )
+    if not os.access(input_path, os.R_OK):
+        raise PermissionError(
+            f"Keine Leseberechtigung für: {input_path}"
+        )
+    size = os.path.getsize(input_path)
+    if size == 0:
+        raise ValueError(
+            "Die Datei ist leer (0 Bytes)."
+        )
+    if size > 500_000_000:  # 500 MB
+        raise ValueError(
+            f"Die Datei ist zu groß ({size / 1e6:.0f} MB).\n"
+            f"Maximale Dateigröße: 500 MB."
+        )
+
+
 def prepare_input(
     input_path: str,
     api_key: Optional[str] = None,
@@ -284,6 +352,7 @@ def prepare_input(
     If the returned path differs from *input_path*, it is a temporary file
     that the caller should clean up when done.
     """
+    validate_input_file(input_path)
     ext = os.path.splitext(input_path)[1].lower()
 
     if ext not in SUPPORTED_EXTENSIONS:
@@ -291,6 +360,8 @@ def prepare_input(
             f"Nicht unterstütztes Dateiformat: {ext}\n"
             f"Unterstützt: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
+
+    logger.info("Eingabe wird vorbereitet: %s (%s)", input_path, ext)
 
     if ext in (".jpg", ".jpeg"):
         if status_callback:
@@ -367,17 +438,36 @@ def _page_is_scan(page) -> bool:
 
 def extract_text(pdf_path: str) -> str:
     """Extract the full plain text from a PDF. Requires the PDF to have embedded text."""
-    doc = fitz.open(pdf_path)
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        logger.error("PDF konnte nicht geöffnet werden: %s – %s", pdf_path, e)
+        raise RuntimeError(
+            f"Das PDF konnte nicht geöffnet werden: {e}\n"
+            "Die Datei ist möglicherweise beschädigt oder kein gültiges PDF."
+        )
     pages_text: List[str] = []
-    for page in doc:
-        pages_text.append(page.get_text("text"))
-    doc.close()
+    try:
+        for i, page in enumerate(doc):
+            try:
+                text = page.get_text("text")
+                # Replace invalid characters that could cause issues downstream
+                text = text.replace("\x00", "")
+                pages_text.append(text)
+            except Exception:
+                logger.warning("Text-Extraktion fehlgeschlagen auf Seite %d", i + 1,
+                               exc_info=True)
+                pages_text.append("")  # skip broken page, continue with rest
+    finally:
+        doc.close()
+
     full = "\n".join(pages_text)
     if not full.strip():
         raise ValueError(
             "Das PDF enthält keinen erkennbaren Text. "
             "Bitte stellen Sie sicher, dass das PDF Texterkennung (OCR) hat."
         )
+    logger.info("Text extrahiert: %d Zeichen aus %d Seiten", len(full), len(pages_text))
     return full
 
 
@@ -1297,116 +1387,162 @@ def redact_pdf(
 
     Returns the output path.
     """
-    doc = fitz.open(pdf_path)
+    # Validate output path before doing expensive work
+    out_dir = os.path.dirname(output_path) or "."
+    if not os.path.isdir(out_dir):
+        raise RuntimeError(
+            f"Ausgabeverzeichnis existiert nicht: {out_dir}"
+        )
+    if not os.access(out_dir, os.W_OK):
+        raise PermissionError(
+            f"Keine Schreibberechtigung für: {out_dir}"
+        )
+    # Check disk space (need at least input file size)
+    try:
+        input_size = os.path.getsize(pdf_path)
+        free_space = shutil.disk_usage(out_dir).free
+        if free_space < input_size * 2:
+            raise RuntimeError(
+                f"Nicht genügend Speicherplatz.\n"
+                f"Verfügbar: {free_space / 1e6:.0f} MB, "
+                f"benötigt: ~{input_size * 2 / 1e6:.0f} MB."
+            )
+    except OSError:
+        pass  # can't check → proceed anyway
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        logger.error("PDF konnte nicht geöffnet werden: %s – %s", pdf_path, e)
+        raise RuntimeError(
+            f"Das PDF konnte nicht geöffnet werden: {e}\n"
+            "Die Datei ist möglicherweise beschädigt."
+        )
+
     total_pages = len(doc)
+    logger.info("Starte Schwärzung: %d Seiten, %d Entitäten",
+                total_pages, len(entity_map))
 
-    # Pre-scan for repeating images (likely logos / letterheads)
-    repeating_xrefs = _find_repeating_image_xrefs(doc)
+    try:
+        # Pre-scan for repeating images (likely logos / letterheads)
+        repeating_xrefs = _find_repeating_image_xrefs(doc)
 
-    # ── Derive implicit PII sub-entities ──
-    # If the AI found "Sparkasse Köln-Bonn" as UNTERNEHMEN, we must also
-    # catch standalone "Sparkasse Köln-Bonn" fragments and the distinctive
-    # core words that clearly identify the same entity.  Similarly for
-    # multi-word person names: "Dr. Hans Müller" → also catch "Hans Müller".
-    _expand_entity_map(entity_map)
+        _expand_entity_map(entity_map)
 
-    # Sort entities by length descending so longer matches are processed first.
-    # Filter out anything that looks like legal numbering / §§ references.
-    sorted_entities = sorted(
-        (k for k in entity_map.keys() if not _is_legal_numbering(k)),
-        key=len, reverse=True,
-    )
+        sorted_entities = sorted(
+            (k for k in entity_map.keys() if not _is_legal_numbering(k)),
+            key=len, reverse=True,
+        )
 
-    for page_idx, page in enumerate(doc):
+        for page_idx, page in enumerate(doc):
+            if progress_callback:
+                progress_callback(int((page_idx / total_pages) * 100))
+
+            try:
+                _redact_page(page, sorted_entities, entity_map, mode,
+                             repeating_xrefs)
+            except Exception:
+                logger.error("Fehler auf Seite %d, überspringe", page_idx + 1,
+                             exc_info=True)
+                # Continue with remaining pages
+
+        # -- Strip ALL metadata from output --
+        _strip_metadata(doc)
+
         if progress_callback:
-            progress_callback(int((page_idx / total_pages) * 100))
+            progress_callback(100)
 
-        # Collect overlay info for every redaction on this page.
-        # After apply_redactions() we re-draw them as shapes to guarantee
-        # the black fill is always visible (fixes white-only output on
-        # some generated PDFs).
-        page_overlays: list = []
-
-        for entity_text in sorted_entities:
-            label, category = entity_map[entity_text]
-
-            # Use quads=True for pixel-precise text location, then
-            # convert each quad to its enclosing rect with a small
-            # vertical pad so the box fully covers the glyphs.
+        # Atomic save: write to temp file first, then rename
+        tmp_out = output_path + ".tmp"
+        try:
+            doc.save(tmp_out, garbage=4, deflate=True)
+            # Rename temp to final (atomic on same filesystem)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+            os.rename(tmp_out, output_path)
+        except Exception as e:
+            # Clean up temp file on save failure
             try:
-                quads = page.search_for(entity_text, quads=True)
-            except Exception:
+                os.unlink(tmp_out)
+            except OSError:
+                pass
+            logger.error("PDF konnte nicht gespeichert werden: %s", e)
+            raise RuntimeError(
+                f"Das PDF konnte nicht gespeichert werden: {e}\n"
+                "Mögliche Ursachen: Speicherplatz voll, keine Schreibrechte, "
+                "oder die Datei wird von einem anderen Programm verwendet."
+            )
+
+        logger.info("PDF gespeichert: %s", output_path)
+        return output_path
+
+    finally:
+        doc.close()
+
+
+def _redact_page(page, sorted_entities: List[str],
+                 entity_map: Dict[str, Tuple[str, str]], mode: str,
+                 repeating_xrefs: set) -> None:
+    """Redact a single page. Extracted for per-page error isolation."""
+    page_overlays: list = []
+
+    for entity_text in sorted_entities:
+        label, category = entity_map[entity_text]
+        try:
+            quads = page.search_for(entity_text, quads=True)
+        except Exception:
+            try:
                 quads = page.search_for(entity_text)
-
-            for q in quads:
-                r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
-                # Slight vertical padding – covers glyphs fully including
-                # descenders/ascenders, without spilling into adjacent lines.
-                r = fitz.Rect(r.x0, r.y0 - 1.0, r.x1, r.y1 + 1.0)
-                info = _add_redaction(page, r, label, mode, category=category)
-                page_overlays.append(info)
-
-        # Detect if this page is a scan (full-page background image).
-        # On scans, image/vector-based detection would analyse the scan
-        # itself and cause massive false positives → skip those methods.
-        page_is_scan = _page_is_scan(page)
-
-        if not page_is_scan:
-            # Redact logos / brand images / letterheads in headers/footers
-            _redact_logo_images(page, repeating_xrefs, mode)
-            # Redact vector drawings in header zone (letterhead graphics)
-            _redact_header_zone_drawings(page)
-
-        # Redact signatures, handwriting, ink annotations, etc.
-        _detect_and_redact_signatures(page, is_scan=page_is_scan)
-
-        # Collect non-entity redaction rects (signatures, logos) from
-        # annotations so we can re-draw them as overlays too.
-        entity_keys = {(round(r.x0, 1), round(r.y0, 1),
-                        round(r.x1, 1), round(r.y1, 1))
-                       for r, _, _, _c in page_overlays}
-        annot = page.first_annot
-        while annot:
-            try:
-                if annot.type[0] == 12:  # PDF_ANNOT_REDACT
-                    r = fitz.Rect(annot.rect)
-                    key = (round(r.x0, 1), round(r.y0, 1),
-                           round(r.x1, 1), round(r.y1, 1))
-                    if key not in entity_keys:
-                        # Non-entity redactions (signatures, logos) → lighter fill
-                        page_overlays.append((r, "", 0, ""))
-                annot = annot.next
             except Exception:
-                break
+                logger.warning("Suche fehlgeschlagen für '%s'", entity_text[:50])
+                continue
 
-        # Apply all redactions for this page at once.
-        # CRITICAL: On scan pages the entire visible content is one big
-        # raster image.  PDF_REDACT_IMAGE_REMOVE would delete it and
-        # wipe the whole page.  PDF_REDACT_IMAGE_PIXELS instead blanks
-        # only the pixels under each annotation → scan stays intact.
-        if page_is_scan:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
-        else:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+        for q in quads:
+            r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
+            r = fitz.Rect(r.x0, r.y0 - 1.0, r.x1, r.y1 + 1.0)
+            info = _add_redaction(page, r, label, mode, category=category)
+            page_overlays.append(info)
 
-        # Re-draw every redacted area as an elegant filled overlay
-        _draw_redaction_overlays(page, page_overlays)
+    page_is_scan = _page_is_scan(page)
 
-    # -- Strip ALL metadata from output --
-    _strip_metadata(doc)
+    if not page_is_scan:
+        _redact_logo_images(page, repeating_xrefs, mode)
+        _redact_header_zone_drawings(page)
 
-    if progress_callback:
-        progress_callback(100)
+    _detect_and_redact_signatures(page, is_scan=page_is_scan)
 
-    doc.save(output_path, garbage=4, deflate=True)
-    doc.close()
-    return output_path
+    entity_keys = {(round(r.x0, 1), round(r.y0, 1),
+                    round(r.x1, 1), round(r.y1, 1))
+                   for r, _, _, _c in page_overlays}
+    annot = page.first_annot
+    while annot:
+        try:
+            if annot.type[0] == 12:
+                r = fitz.Rect(annot.rect)
+                key = (round(r.x0, 1), round(r.y0, 1),
+                       round(r.x1, 1), round(r.y1, 1))
+                if key not in entity_keys:
+                    page_overlays.append((r, "", 0, ""))
+            annot = annot.next
+        except Exception:
+            break
 
+    if page_is_scan:
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+    else:
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+
+    _draw_redaction_overlays(page, page_overlays)
 
 
 def get_page_count(pdf_path: str) -> int:
     """Return the number of pages in a PDF."""
-    doc = fitz.open(pdf_path)
-    count = len(doc)
-    doc.close()
-    return count
+    try:
+        doc = fitz.open(pdf_path)
+        count = len(doc)
+        doc.close()
+        return count
+    except Exception:
+        logger.warning("Seitenanzahl konnte nicht ermittelt werden: %s", pdf_path,
+                       exc_info=True)
+        return 0

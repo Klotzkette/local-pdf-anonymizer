@@ -2,6 +2,7 @@
 PDF Anonymizer – Entry point.
 
 Starts the PyQt6 GUI application for AI-powered PDF anonymisation.
+Installs a global exception handler so the app never crashes silently.
 """
 
 import sys
@@ -29,6 +30,43 @@ else:
 for p in (base_dir, src_dir):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def _install_global_exception_handler():
+    """Install a last-resort exception handler that logs and shows a dialog."""
+    import logging
+
+    def _handler(exc_type, exc_value, exc_tb):
+        if exc_type is KeyboardInterrupt:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+
+        logger = logging.getLogger("pdf_anonymizer")
+        logger.critical("Unbehandelter Fehler", exc_info=(exc_type, exc_value, exc_tb))
+
+        # Try to show an error dialog (may fail if Qt is not running)
+        try:
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            app = QApplication.instance()
+            if app is not None:
+                import traceback
+                tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Icon.Critical)
+                msg.setWindowTitle("Schwerwiegender Fehler")
+                msg.setText(
+                    "Ein unerwarteter Fehler ist aufgetreten.\n\n"
+                    "Das Programm muss möglicherweise neu gestartet werden."
+                )
+                msg.setDetailedText(tb_text)
+                msg.exec()
+        except Exception:
+            pass  # can't show dialog – at least we logged it
+
+    sys.excepthook = _handler
+
+
+_install_global_exception_handler()
 
 from gui import run_app
 

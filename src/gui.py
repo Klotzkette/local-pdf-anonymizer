@@ -54,9 +54,15 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect, QGraphicsOpacityEffect
 
+import logging
+import time as _time
+
+logger = logging.getLogger("pdf_anonymizer")
+
 try:
     from ai_engine import (
         detect_entities, assign_variables, generate_natural_replacements,
+        detect_entities_regex, release_model,
         MODE_ANONYMIZE, MODE_PSEUDO_VARS, MODE_PSEUDO_NATURAL,
         INTENSITY_HARD,
         SCOPE_NAMES_ONLY, SCOPE_ALL,
@@ -65,7 +71,7 @@ try:
     )
     from pdf_processor import (
         extract_text, redact_pdf, get_page_count,
-        prepare_input, SUPPORTED_EXTENSIONS,
+        prepare_input, validate_input_file, SUPPORTED_EXTENSIONS,
     )
 except ImportError as _imp_err:
     _import_error = _imp_err
@@ -687,24 +693,47 @@ class AnonymizeWorker(QThread):
         self._temp_pdf: Optional[str] = None
 
     def run(self):
+        t_start = _time.monotonic()
+        use_regex_fallback = False
+
         try:
             # Step 0 – load model into memory (first call takes a while)
             self.step.emit("Modell laden …")
             self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) wird in den Speicher geladen …")
             self.progress.emit(1)
-            from ai_engine import _load_model
-            _load_model()
+
+            try:
+                from ai_engine import _load_model
+                model = _load_model()
+                if model is None:
+                    logger.warning("Modell konnte nicht geladen werden, "
+                                   "verwende Regex-Fallback")
+                    self.status.emit("KI-Modell nicht verfügbar – verwende einfache Erkennung …")
+                    use_regex_fallback = True
+            except Exception:
+                logger.error("Modell-Laden fehlgeschlagen", exc_info=True)
+                self.status.emit("KI-Modell nicht verfügbar – verwende einfache Erkennung …")
+                use_regex_fallback = True
 
             # Step 1 – prepare input (convert / OCR if needed)
             self.step.emit("Schritt 1/5  –  Datei vorbereiten")
             self.status.emit("Eingabedatei wird vorbereitet …")
             self.progress.emit(2)
 
-            pdf_path = prepare_input(
-                self.input_path,
-                api_key=self.api_key,
-                status_callback=lambda msg: self.status.emit(msg),
-            )
+            try:
+                pdf_path = prepare_input(
+                    self.input_path,
+                    api_key=self.api_key,
+                    status_callback=lambda msg: self.status.emit(msg),
+                )
+            except Exception as e:
+                self.finished_err.emit(
+                    f"Datei-Fehler: {e}\n\n"
+                    "Die Eingabedatei konnte nicht verarbeitet werden.\n"
+                    "Bitte prüfen Sie, ob die Datei gültig und nicht beschädigt ist."
+                )
+                return
+
             if pdf_path != self.input_path:
                 self._temp_pdf = pdf_path  # remember for cleanup
 
@@ -712,22 +741,43 @@ class AnonymizeWorker(QThread):
             self.step.emit("Schritt 2/5  –  Text extrahieren")
             self.status.emit("Text wird aus dem PDF extrahiert …")
             self.progress.emit(8)
-            text = extract_text(pdf_path)
 
-            # Step 3 – AI entity detection
-            self.step.emit("Schritt 3/5  –  KI-Analyse")
-            self.status.emit("KI analysiert den Text …")
+            try:
+                text = extract_text(pdf_path)
+            except Exception as e:
+                self._cleanup_temp()
+                self.finished_err.emit(
+                    f"Text-Extraktion fehlgeschlagen: {e}\n\n"
+                    "Der Text konnte nicht aus dem PDF gelesen werden.\n"
+                    "Möglicherweise ist die Datei beschädigt oder enthält keinen Text."
+                )
+                return
+
+            # Step 3 – AI entity detection (with regex fallback)
+            provider = "regex" if use_regex_fallback else self.provider
+            if use_regex_fallback:
+                self.step.emit("Schritt 3/5  –  Muster-Erkennung")
+                self.status.emit("Einfache Muster-Erkennung läuft …")
+            else:
+                self.step.emit("Schritt 3/5  –  KI-Analyse")
+                self.status.emit("KI analysiert den Text …")
             self.progress.emit(12)
 
             def _ai_progress(pct):
                 self.progress.emit(12 + int(pct * 0.28))
 
-            entities = detect_entities(
-                self.provider, self.api_key, text,
-                progress_callback=_ai_progress,
-                intensity=INTENSITY_HARD,
-                scope=self.scope,
-            )
+            try:
+                entities = detect_entities(
+                    provider, self.api_key, text,
+                    progress_callback=_ai_progress,
+                    intensity=INTENSITY_HARD,
+                    scope=self.scope,
+                )
+            except Exception:
+                logger.error("Entitäten-Erkennung fehlgeschlagen, "
+                             "Fallback auf Regex", exc_info=True)
+                self.status.emit("KI-Fehler – verwende einfache Erkennung …")
+                entities = detect_entities_regex(text, self.scope)
 
             if not entities:
                 self.entity_count.emit(0)
@@ -743,13 +793,19 @@ class AnonymizeWorker(QThread):
 
             # Step 4 – assign labels (variables / natural replacements)
             replacements = None
-            if self.mode == MODE_PSEUDO_NATURAL:
+            if self.mode == MODE_PSEUDO_NATURAL and not use_regex_fallback:
                 self.step.emit("Schritt 4/5  –  Natürliche Ersetzungen generieren")
                 self.status.emit(f"{len(entities)} Entitäten erkannt – generiere Ersetzungen …")
                 self.progress.emit(42)
-                replacements = generate_natural_replacements(
-                    self.provider, self.api_key, entities,
-                )
+                try:
+                    replacements = generate_natural_replacements(
+                        self.provider, self.api_key, entities,
+                    )
+                except Exception:
+                    logger.error("Ersetzungs-Generierung fehlgeschlagen", exc_info=True)
+                    self.status.emit("Ersetzungs-Generierung fehlgeschlagen, "
+                                     "verwende Variablen-Modus …")
+                    replacements = None
             else:
                 self.step.emit("Schritt 4/5  –  Variablen zuweisen")
                 self.status.emit(f"{len(entities)} Entitäten erkannt …")
@@ -768,19 +824,35 @@ class AnonymizeWorker(QThread):
             def _pdf_progress(pct):
                 self.progress.emit(45 + int(pct * 0.50))
 
-            redact_pdf(
-                pdf_path, self.output_path, entity_map,
-                mode=self.mode, progress_callback=_pdf_progress,
-                api_key=self.api_key,
-            )
+            try:
+                redact_pdf(
+                    pdf_path, self.output_path, entity_map,
+                    mode=self.mode, progress_callback=_pdf_progress,
+                    api_key=self.api_key,
+                )
+            except Exception as e:
+                self._cleanup_temp()
+                self.finished_err.emit(
+                    f"PDF-Fehler: {e}\n\n"
+                    "Das PDF konnte nicht geschwärzt werden.\n"
+                    "Bitte prüfen Sie Speicherplatz und Schreibrechte."
+                )
+                return
 
             self._cleanup_temp()
             self.progress.emit(100)
+            elapsed = _time.monotonic() - t_start
+            logger.info("Verarbeitung abgeschlossen in %.1f Sekunden", elapsed)
             self.finished_ok.emit(self.output_path)
 
         except Exception as e:
             self._cleanup_temp()
-            self.finished_err.emit(f"{e}\n\n{traceback.format_exc()}")
+            logger.error("Unerwarteter Fehler in AnonymizeWorker", exc_info=True)
+            self.finished_err.emit(
+                f"Unerwarteter Fehler: {e}\n\n"
+                "Bitte prüfen Sie die Log-Datei für Details:\n"
+                f"{os.path.expanduser('~/.cache/pdf_anonymizer/anonymizer.log')}"
+            )
 
     def _cleanup_temp(self):
         """Remove temporary PDF created during conversion/OCR."""
