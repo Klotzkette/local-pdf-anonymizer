@@ -405,13 +405,36 @@ def _load_model():
     except (ImportError, OSError, Exception):
         pass  # any failure → stay on CPU
 
-    _llm = Llama(
-        model_path=str(_GGUF_PATH),
-        n_ctx=32768,
-        n_gpu_layers=n_gpu,
-        verbose=False,
-    )
-    return _llm
+    # Force-disable GPU backends via environment so that llama.cpp's
+    # internal backend init never touches GPU drivers.  This prevents
+    # access-violation crashes in PyInstaller bundles where the CUDA/
+    # Vulkan/Metal shared libraries are absent or incompatible.
+    if n_gpu == 0:
+        os.environ.setdefault("GGML_CUDA", "0")
+        os.environ.setdefault("GGML_VULKAN", "0")
+        os.environ.setdefault("GGML_METAL", "0")
+
+    # The Llama constructor can itself trigger an access violation on
+    # CPU-only PyInstaller builds even with n_gpu_layers=0.  If that
+    # happens, retry once with n_gpu forced to 0.
+    for attempt in range(2):
+        try:
+            _llm = Llama(
+                model_path=str(_GGUF_PATH),
+                n_ctx=32768,
+                n_gpu_layers=n_gpu,
+                flash_attn=False,
+                verbose=False,
+            )
+            return _llm
+        except OSError:
+            if attempt == 0:
+                n_gpu = 0
+                os.environ["GGML_CUDA"] = "0"
+                os.environ["GGML_VULKAN"] = "0"
+                os.environ["GGML_METAL"] = "0"
+                continue
+            raise
 
 
 def _run_qwen_inference(
