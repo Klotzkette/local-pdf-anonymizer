@@ -336,11 +336,20 @@ _GGUF_PATH = _MODEL_DIR / GGUF_FILENAME
 
 # Module-level model cache (loaded once, reused for every call)
 _llm = None
+_preload_thread: Optional[threading.Thread] = None
+_preload_lock = threading.Lock()
+
+
+def _resolve_model_path() -> Optional[Path]:
+    """Return the actual path to the GGUF file, checking symlink target too."""
+    if _GGUF_PATH.is_file() and _GGUF_PATH.stat().st_size > 1_000_000:
+        return _GGUF_PATH
+    return None
 
 
 def is_model_downloaded() -> bool:
     """Return True if the GGUF model file exists on disk."""
-    return _GGUF_PATH.is_file() and _GGUF_PATH.stat().st_size > 1_000_000
+    return _resolve_model_path() is not None
 
 
 def download_model(progress_callback=None) -> None:
@@ -435,11 +444,25 @@ def download_model(progress_callback=None) -> None:
             "Download fehlgeschlagen: HuggingFace hat keine Datei zurückgegeben."
         )
 
-    # Copy from HF cache to our model directory
+    # Link from HF cache to our model directory (avoids 6 GB duplication).
+    # Try symlink first (fast, saves disk), fall back to hard link, then copy.
     if not _GGUF_PATH.is_file():
         if progress_callback:
-            progress_callback(96, "Kopiere Modell …")
-        shutil.copy2(cached_path, _GGUF_PATH)
+            progress_callback(96, "Verknüpfe Modell …")
+        cached = Path(cached_path)
+        linked = False
+        for link_fn in (os.symlink, os.link):
+            try:
+                link_fn(cached, _GGUF_PATH)
+                linked = True
+                logger.info("Modell verknüpft via %s", link_fn.__name__)
+                break
+            except OSError:
+                pass
+        if not linked:
+            if progress_callback:
+                progress_callback(96, "Kopiere Modell …")
+            shutil.copy2(cached_path, _GGUF_PATH)
 
     logger.info("Modell-Download abgeschlossen: %s", _GGUF_PATH)
     if progress_callback:
@@ -489,82 +512,205 @@ def _safe_backend_init():
         pass  # internal API changed – the constructor will try itself
 
 
+def _optimal_threads() -> int:
+    """Return number of threads to use for inference (physical cores)."""
+    n = os.cpu_count() or 4
+    # Rough heuristic: use physical cores (half of logical on HT systems).
+    # But at least 2, at most 16 to avoid diminishing returns.
+    phys = max(2, min(16, n // 2 or n))
+    return phys
+
+
+def _warm_page_cache(path: Path) -> None:
+    """Read the entire file sequentially to pull it into the OS page cache.
+
+    This is much faster than mlock because:
+    - It uses large sequential reads (the OS prefetcher helps)
+    - It runs before the Llama constructor, so by the time mmap maps
+      the file, the pages are already resident in RAM
+    - On Linux, posix_fadvise WILLNEED triggers async readahead
+    """
+    file_size = path.stat().st_size
+    t0 = time.monotonic()
+
+    # Try posix_fadvise first (Linux) – non-blocking async readahead
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_WILLNEED)
+            logger.info("posix_fadvise WILLNEED gesetzt für %.1f GB",
+                        file_size / 1e9)
+        finally:
+            os.close(fd)
+    except (AttributeError, OSError):
+        pass  # Not Linux or fadvise unavailable
+
+    # Sequential read in large chunks to ensure pages are resident.
+    # 4MB chunks maximize throughput on SSDs and HDDs alike.
+    CHUNK = 4 * 1024 * 1024
+    read_bytes = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(CHUNK)
+                if not data:
+                    break
+                read_bytes += len(data)
+    except OSError as e:
+        logger.warning("Page-Cache-Warming fehlgeschlagen: %s", e)
+        return
+
+    elapsed = time.monotonic() - t0
+    speed = (read_bytes / 1e9) / elapsed if elapsed > 0 else 0
+    logger.info("Page-Cache-Warming: %.1f GB in %.1f s (%.1f GB/s)",
+                read_bytes / 1e9, elapsed, speed)
+
+
 def _load_model():
     """Load the GGUF model via llama-cpp-python (cached globally).
 
     Returns the Llama instance, or None if loading fails.
+    Thread-safe: concurrent calls block until the first load finishes.
     """
     global _llm
     if _llm is not None:
         return _llm
 
-    if not _GGUF_PATH.is_file():
-        logger.error("Modell-Datei nicht gefunden: %s", _GGUF_PATH)
-        return None
+    with _preload_lock:
+        # Double-check after acquiring lock
+        if _llm is not None:
+            return _llm
 
-    # Validate GGUF magic bytes
-    try:
-        with open(_GGUF_PATH, "rb") as f:
-            magic = f.read(4)
-        if magic != b"GGUF":
-            logger.error("Ungültige GGUF-Datei (magic: %r). Datei evtl. korrupt.", magic)
+        model_path = _resolve_model_path()
+        if model_path is None:
+            logger.error("Modell-Datei nicht gefunden: %s", _GGUF_PATH)
             return None
-    except OSError as e:
-        logger.error("Modell-Datei nicht lesbar: %s", e)
-        return None
 
-    t0 = time.monotonic()
-    logger.info("Lade Modell: %s", _GGUF_PATH)
-
-    # Force-disable GPU backends via environment BEFORE importing llama_cpp
-    # so that llama.cpp's internal backend init never touches GPU drivers.
-    os.environ["GGML_CUDA"] = "0"
-    os.environ["GGML_VULKAN"] = "0"
-    os.environ["GGML_METAL"] = "0"
-
-    try:
-        # Safe backend init: catches access violations from GPU probing
-        _safe_backend_init()
-
-        from llama_cpp import Llama
-
-        # Detect GPU
-        n_gpu = 0
+        # Validate GGUF magic bytes
         try:
-            from llama_cpp import llama_supports_gpu_offload
-            if llama_supports_gpu_offload():
-                n_gpu = -1
-                logger.info("GPU-Offload verfügbar")
-        except (ImportError, OSError, Exception):
-            logger.info("Kein GPU-Offload, verwende CPU")
+            with open(model_path, "rb") as f:
+                magic = f.read(4)
+            if magic != b"GGUF":
+                logger.error("Ungültige GGUF-Datei (magic: %r). Datei evtl. korrupt.", magic)
+                return None
+        except OSError as e:
+            logger.error("Modell-Datei nicht lesbar: %s", e)
+            return None
+
+        t0 = time.monotonic()
+        logger.info("Lade Modell: %s", model_path)
+
+        # Phase 1: Pull entire file into OS page cache BEFORE llama.cpp
+        # touches it. This makes the subsequent mmap near-instant because
+        # all pages are already resident.
+        _warm_page_cache(model_path)
+
+        # Force-disable GPU backends via environment BEFORE importing llama_cpp
+        # so that llama.cpp's internal backend init never touches GPU drivers.
+        os.environ["GGML_CUDA"] = "0"
+        os.environ["GGML_VULKAN"] = "0"
+        os.environ["GGML_METAL"] = "0"
+
+        n_threads = _optimal_threads()
+        logger.info("Verwende %d Threads für Inferenz", n_threads)
 
         try:
-            _llm = Llama(
-                model_path=str(_GGUF_PATH),
-                n_ctx=32768,
-                n_gpu_layers=n_gpu,
-                flash_attn=False,
-                verbose=False,
-            )
-        except OSError:
-            logger.warning("Modell-Laden mit n_ctx=32768 fehlgeschlagen, "
-                           "versuche n_ctx=8192", exc_info=True)
-            _llm = Llama(
-                model_path=str(_GGUF_PATH),
-                n_ctx=8192,
-                n_gpu_layers=0,
-                flash_attn=False,
-                verbose=False,
-            )
+            # Safe backend init: catches access violations from GPU probing
+            _safe_backend_init()
 
+            from llama_cpp import Llama
+
+            # Detect GPU
+            n_gpu = 0
+            try:
+                from llama_cpp import llama_supports_gpu_offload
+                if llama_supports_gpu_offload():
+                    n_gpu = -1
+                    logger.info("GPU-Offload verfügbar")
+            except (ImportError, OSError, Exception):
+                logger.info("Kein GPU-Offload, verwende CPU")
+
+            # Phase 2: Load model. use_mlock=False because page cache warming
+            # already made all pages resident; mlock would just slow things
+            # down by forcing synchronous page faults.
+            try:
+                _llm = Llama(
+                    model_path=str(model_path),
+                    n_ctx=16384,
+                    n_gpu_layers=n_gpu,
+                    n_threads=n_threads,
+                    n_threads_batch=n_threads,
+                    flash_attn=True,
+                    verbose=False,
+                    use_mmap=True,
+                    use_mlock=False,
+                )
+            except (OSError, Exception) as first_err:
+                logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
+                               "versuche n_ctx=8192", first_err, exc_info=True)
+                _llm = Llama(
+                    model_path=str(model_path),
+                    n_ctx=8192,
+                    n_gpu_layers=0,
+                    n_threads=n_threads,
+                    n_threads_batch=n_threads,
+                    flash_attn=False,
+                    verbose=False,
+                    use_mmap=True,
+                    use_mlock=False,
+                )
+
+            elapsed = time.monotonic() - t0
+            logger.info("Modell geladen in %.1f Sekunden", elapsed)
+            return _llm
+
+        except Exception:
+            logger.error("Modell konnte nicht geladen werden", exc_info=True)
+            release_model()
+            return None
+
+
+def preload_model() -> None:
+    """Start loading the model into RAM in a background thread.
+
+    Call this at app startup so the model is ready when the user drops a file.
+    Safe to call multiple times; only the first call triggers loading.
+    """
+    global _preload_thread
+    if _llm is not None:
+        return
+    if not is_model_downloaded():
+        return
+    if _preload_thread is not None and _preload_thread.is_alive():
+        return
+
+    def _bg_load():
+        t0 = time.monotonic()
+        logger.info("Hintergrund-Preload gestartet")
+        _load_model()
         elapsed = time.monotonic() - t0
-        logger.info("Modell geladen in %.1f Sekunden", elapsed)
-        return _llm
+        if _llm is not None:
+            logger.info("Hintergrund-Preload abgeschlossen in %.1f s", elapsed)
+        else:
+            logger.warning("Hintergrund-Preload fehlgeschlagen nach %.1f s", elapsed)
 
-    except Exception:
-        logger.error("Modell konnte nicht geladen werden", exc_info=True)
-        release_model()
-        return None
+    _preload_thread = threading.Thread(target=_bg_load, daemon=True, name="model-preload")
+    _preload_thread.start()
+
+
+def is_model_loaded() -> bool:
+    """Return True if the model is currently loaded in RAM."""
+    return _llm is not None
+
+
+def wait_for_preload(timeout: float = 120.0) -> bool:
+    """Block until the background preload finishes (or timeout). Returns True if model loaded."""
+    if _llm is not None:
+        return True
+    if _preload_thread is not None and _preload_thread.is_alive():
+        _preload_thread.join(timeout=timeout)
+    return _llm is not None
 
 
 def _run_qwen_inference(
