@@ -541,13 +541,15 @@ def _load_model():
         try:
             _llm = Llama(
                 model_path=str(_GGUF_PATH),
-                n_ctx=32768,
+                n_ctx=16384,
                 n_gpu_layers=n_gpu,
                 flash_attn=False,
                 verbose=False,
+                use_mmap=True,
+                use_mlock=False,
             )
         except OSError:
-            logger.warning("Modell-Laden mit n_ctx=32768 fehlgeschlagen, "
+            logger.warning("Modell-Laden mit n_ctx=16384 fehlgeschlagen, "
                            "versuche n_ctx=8192", exc_info=True)
             _llm = Llama(
                 model_path=str(_GGUF_PATH),
@@ -555,6 +557,8 @@ def _load_model():
                 n_gpu_layers=0,
                 flash_attn=False,
                 verbose=False,
+                use_mmap=True,
+                use_mlock=False,
             )
 
         elapsed = time.monotonic() - t0
