@@ -112,8 +112,8 @@ jobs:
             ## PDF Anonymizer - Lokale KI-Anonymisierung
 
             **Downloads:**
-            - **Windows:** `PDFAnonymizer-Windows.zip` herunterladen, entpacken und starten
-            - **Mac:** `PDFAnonymizer-Mac.zip` herunterladen, entpacken und starten
+            - **Windows:** [PDFAnonymizer-Windows.zip](https://github.com/Klotzkette/local-pdf-anonymizer/releases/download/latest/PDFAnonymizer-Windows.zip) herunterladen, entpacken und starten
+            - **Mac:** [PDFAnonymizer-Mac.zip](https://github.com/Klotzkette/local-pdf-anonymizer/releases/download/latest/PDFAnonymizer-Mac.zip) herunterladen, entpacken und starten
 
             Dieser Release wird bei jedem Push automatisch aktualisiert.
 
