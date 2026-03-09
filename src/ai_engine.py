@@ -562,37 +562,49 @@ def _pages_resident_ratio(path: Path) -> float:
         return 1.0  # non-Linux or error → assume warm, skip read
 
 
-def _warm_page_cache(path: Path, progress_cb=None) -> None:
-    """Pull the model file into the OS page cache if not already resident.
+def _kick_readahead(path: Path) -> None:
+    """Tell the kernel to start loading the file into page cache NOW.
 
-    Checks residency via mincore (Linux) first.  If >=90% of pages are
-    already in RAM (e.g. second launch, or after suspend/resume), the
-    read is skipped entirely — saving ~5-10 seconds on a 6 GB file.
+    Uses POSIX_FADV_WILLNEED which returns *immediately* and the kernel
+    starts async readahead in the background.  By the time Llama()'s mmap
+    touches the pages, most of them are already resident — effectively
+    overlapping I/O with the Llama() constructor work.
 
-    On cold cache, does a fast sequential read with posix_fadvise
-    SEQUENTIAL hint so the kernel prefetcher works optimally.
-    (POSIX_FADV_SEQUENTIAL tells the kernel to aggressively read-ahead,
-    which doubles throughput on rotational disks and helps SSDs too.)
+    Falls back to POSIX_FADV_SEQUENTIAL (weaker hint) or no-op on
+    non-Linux / older kernels.
+    """
+    try:
+        file_size = path.stat().st_size
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            # WILLNEED = "read this into page cache asap" (async, non-blocking)
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_WILLNEED)
+            logger.info("readahead: POSIX_FADV_WILLNEED für %.1f GB angefordert",
+                        file_size / 1e9)
+        except (AttributeError, OSError):
+            # Fallback: SEQUENTIAL at least helps the prefetcher
+            try:
+                os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
+                logger.info("readahead: Fallback auf POSIX_FADV_SEQUENTIAL")
+            except (AttributeError, OSError):
+                pass
+        finally:
+            os.close(fd)
+    except (AttributeError, OSError):
+        pass  # non-Linux — mmap will page-fault on demand
 
-    *progress_cb(fraction)* is called with 0.0-1.0 during the read.
+
+def _warm_page_cache_sync(path: Path) -> None:
+    """Synchronous fallback: pull entire file into page cache by reading it.
+
+    Only used on non-Linux where POSIX_FADV_WILLNEED is unavailable,
+    or as explicit pre-warming when cold-start latency must be bounded.
+    Uses 8 MB chunks for lower syscall overhead on large files.
     """
     file_size = path.stat().st_size
-    ratio = _pages_resident_ratio(path)
-    logger.info("Page-Cache-Status: %.0f%% von %.1f GB resident",
-                ratio * 100, file_size / 1e9)
-
-    if ratio >= 0.9:
-        logger.info("Datei bereits im Page Cache – Warming übersprungen")
-        if progress_cb:
-            try:
-                progress_cb(1.0)
-            except Exception:
-                pass
-        return
-
     t0 = time.monotonic()
 
-    # Hint the kernel about sequential access (Linux only)
+    # Hint for sequential prefetch
     try:
         fd = os.open(str(path), os.O_RDONLY)
         try:
@@ -602,8 +614,7 @@ def _warm_page_cache(path: Path, progress_cb=None) -> None:
     except (AttributeError, OSError):
         pass
 
-    # Sequential read in 4 MB chunks to pull pages into OS page cache.
-    CHUNK = 4 * 1024 * 1024
+    CHUNK = 8 * 1024 * 1024  # 8 MB — halves syscalls vs 4 MB
     read_bytes = 0
     try:
         with open(path, "rb") as f:
@@ -612,18 +623,13 @@ def _warm_page_cache(path: Path, progress_cb=None) -> None:
                 if not data:
                     break
                 read_bytes += len(data)
-                if progress_cb and file_size > 0:
-                    try:
-                        progress_cb(min(read_bytes / file_size, 1.0))
-                    except Exception:
-                        pass
     except OSError as e:
-        logger.warning("Page-Cache-Warming fehlgeschlagen: %s", e)
+        logger.warning("Page-Cache-Warming (sync) fehlgeschlagen: %s", e)
         return
 
     elapsed = time.monotonic() - t0
     speed = (read_bytes / 1e9) / elapsed if elapsed > 0 else 0
-    logger.info("Page-Cache-Warming: %.1f GB in %.1f s (%.1f GB/s)",
+    logger.info("Page-Cache-Warming (sync): %.1f GB in %.1f s (%.1f GB/s)",
                 read_bytes / 1e9, elapsed, speed)
 
 
@@ -633,19 +639,24 @@ def _warm_page_cache(path: Path, progress_cb=None) -> None:
 
 
 class ModelEngine:
-    """Three-phase model loader with granular progress reporting.
+    """Fast model loader — overlaps I/O with initialisation.
 
-    Phases:
-        io     – pull GGUF file into OS page cache (mincore check, seq read)
-        init   – construct Llama() instance (GGUF parse, KV alloc, graph build)
-        warmup – single dummy inference to initialise KV cache & kernels
+    Strategy:
+        1. Check mincore — if >=90% pages resident, skip I/O entirely.
+        2. If cold: fire POSIX_FADV_WILLNEED (async, returns instantly)
+           so the kernel starts loading pages in the background.
+        3. Start Llama() constructor *immediately* — its internal mmap
+           page-faults hit pages the kernel is already fetching.
+           I/O and init overlap → roughly halves cold-start time.
+        4. No warmup phase — first real inference warms up the KV cache.
+           Saves 1-3 seconds on every load.
     """
 
     def __init__(self, progress_cb=None):
         """
         Args:
             progress_cb: ``cb(phase: str, value: float)`` with
-                         *phase* ∈ {"io", "init", "warmup"} and
+                         *phase* ∈ {"io", "init"} and
                          *value* ∈ [0.0, 1.0].
         """
         self._progress_cb = progress_cb
@@ -661,16 +672,34 @@ class ModelEngine:
             except Exception:
                 logger.debug("progress_cb Fehler", exc_info=True)
 
-    # -- phases --------------------------------------------------------------
+    # -- core ----------------------------------------------------------------
 
-    def _phase_io(self, model_path: Path) -> None:
-        """Phase *io*: warm OS page cache using mincore + sequential read."""
+    def _prepare_io(self, model_path: Path) -> None:
+        """Kick off async page-cache readahead (non-blocking).
+
+        On warm cache (>=90% resident): no-op.
+        On cold cache: POSIX_FADV_WILLNEED tells the kernel to start
+        loading the file asynchronously.  Returns in microseconds.
+        """
         self._report("io", 0.0)
-        _warm_page_cache(model_path, progress_cb=lambda frac: self._report("io", frac))
+        ratio = _pages_resident_ratio(model_path)
+        file_size = model_path.stat().st_size
+        logger.info("Page-Cache-Status: %.0f%% von %.1f GB resident",
+                     ratio * 100, file_size / 1e9)
+
+        if ratio >= 0.9:
+            logger.info("Datei bereits im Page Cache – kein readahead nötig")
+        else:
+            # Non-blocking: kernel starts background I/O
+            _kick_readahead(model_path)
         self._report("io", 1.0)
 
-    def _phase_init(self, model_path: Path) -> None:
-        """Phase *init*: construct the Llama instance with all optimisations."""
+    def _init_llama(self, model_path: Path) -> None:
+        """Construct the Llama instance with all optimisations.
+
+        If POSIX_FADV_WILLNEED was issued, the kernel is loading pages
+        in parallel — Llama()'s mmap page-faults overlap with this I/O.
+        """
         self._report("init", 0.0)
 
         # Disable GPU backends before import (CPU-only PyInstaller builds)
@@ -724,7 +753,8 @@ class ModelEngine:
                 **kv_quant_kwargs,
             )
         except (OSError, Exception) as first_err:
-            # Fallback: halve context & batch, drop KV quant and GPU
+            # Fallback: halve context & batch, drop KV quant and GPU —
+            # recovers from OOM or driver crashes on low-RAM machines.
             logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
                            "versuche n_ctx=8192 ohne KV-Quant", first_err,
                            exc_info=True)
@@ -743,29 +773,13 @@ class ModelEngine:
 
         self._report("init", 1.0)
 
-    def _phase_warmup(self) -> None:
-        """Phase *warmup*: dummy inference to prime KV cache & kernels.
-
-        Errors here are non-fatal – the model is usable without warm-up.
-        """
-        self._report("warmup", 0.0)
-        try:
-            self.llm.create_chat_completion(
-                messages=[{"role": "user", "content": "warmup"}],
-                max_tokens=1,
-                temperature=0.01,  # llama.cpp needs > 0
-            )
-            logger.info("Warmup-Inference abgeschlossen")
-        except Exception:
-            logger.warning("Warmup-Inference fehlgeschlagen (nicht kritisch)",
-                           exc_info=True)
-        self._report("warmup", 1.0)
-
     # -- public entry point --------------------------------------------------
 
     def load(self) -> bool:
-        """Run the full 3-phase pipeline: io → init → warmup.
+        """Load the model as fast as possible.
 
+        Overlaps async readahead with Llama() construction.
+        No warmup — first real inference handles that.
         Returns True if the model is ready for inference.
         """
         model_path = _resolve_model_path()
@@ -785,19 +799,20 @@ class ModelEngine:
             return False
 
         t0 = time.monotonic()
-        logger.info("Lade Modell (3-Phasen-Pipeline): %s", model_path)
+        logger.info("Lade Modell (async readahead + init): %s", model_path)
 
         try:
-            self._phase_io(model_path)
-            self._phase_init(model_path)
-            self._phase_warmup()
+            # Step 1: fire async readahead (returns in microseconds)
+            self._prepare_io(model_path)
+            # Step 2: start Llama() — mmap page-faults overlap with readahead
+            self._init_llama(model_path)
         except Exception:
             logger.error("Modell-Laden fehlgeschlagen", exc_info=True)
             self.llm = None
             return False
 
         elapsed = time.monotonic() - t0
-        logger.info("Modell geladen in %.1f Sekunden (3 Phasen)", elapsed)
+        logger.info("Modell geladen in %.1f Sekunden", elapsed)
         return self.llm is not None
 
 

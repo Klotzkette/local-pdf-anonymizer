@@ -686,9 +686,8 @@ class ModelLoadWorker(QThread):
     finished_err = pyqtSignal(str)
 
     _PHASE_LABELS = {
-        "io":     "Page-Cache laden …",
-        "init":   "Modell initialisieren …",
-        "warmup": "Warm-Up …",
+        "io":   "Readahead …",
+        "init": "Modell laden …",
     }
 
     def _on_progress(self, phase: str, value: float) -> None:
