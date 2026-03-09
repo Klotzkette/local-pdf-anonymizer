@@ -120,10 +120,12 @@ jobs:
             ---
 
             ### Features
+            - **3-Phasen Lade-Pipeline:** Strukturiertes Model-Loading (io → init → warmup) mit Progress-Events
+            - **Page-Cache-Warming:** mincore-Check + posix_fadvise fuer optimales I/O
+            - **Warm-Up Inference:** KV-Cache-Initialisierung beim Start (non-fatal)
             - **KI-Modell:** Qwen3.5-9B (GGUF Q4_K_M) - schnell und praezise
-            - **Robuster Download:** Zuverlaessiger Modell-Download
-            - **Schnelle Analyse:** Optimierte Inferenz mit mmap, KV-Cache und Preload
-            - **Fehlerbehandlung:** Teilweise Ergebnisse bei grossen Dokumenten
+            - **Performance:** n_batch=1024, KV-Cache Q8_0, Thread-Split Optimierung
+            - **Crash-Sicherheit:** Logging, Regex-Fallback, robuste Fehlerbehandlung
             - **Kompakt:** Kein torch/transformers noetig
             - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
             - **Datenschutz:** Keine Daten verlassen Ihr Geraet

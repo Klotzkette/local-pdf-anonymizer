@@ -68,6 +68,7 @@ try:
         SCOPE_NAMES_ONLY, SCOPE_ALL,
         is_model_downloaded, download_model,
         is_model_loaded, preload_model, wait_for_preload,
+        load_model_with_progress, ModelEngine,
         MODEL_DISPLAY_NAME,
     )
     from pdf_processor import (
@@ -89,6 +90,10 @@ except ImportError as _imp_err:
     def is_model_loaded(): return False
     def preload_model(): pass
     def wait_for_preload(timeout=120.0): return False
+    def load_model_with_progress(progress_cb=None): return False
+    class ModelEngine:
+        def __init__(self, progress_cb=None): pass
+        def load(self): return False
 else:
     _import_error = None
 
@@ -667,6 +672,47 @@ class DropZone(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# Global model-load progress state  (read by GUI via QTimer polling)
+# ---------------------------------------------------------------------------
+
+_current_progress = {"phase": "", "value": 0.0, "running": False, "error": ""}
+
+
+class ModelLoadWorker(QThread):
+    """Loads the AI model using the 3-phase pipeline with progress signals."""
+
+    phase_progress = pyqtSignal(str, float)   # (phase, value 0.0-1.0)
+    finished_ok = pyqtSignal()
+    finished_err = pyqtSignal(str)
+
+    _PHASE_LABELS = {
+        "io":     "Page-Cache laden …",
+        "init":   "Modell initialisieren …",
+        "warmup": "Warm-Up …",
+    }
+
+    def _on_progress(self, phase: str, value: float) -> None:
+        _current_progress["phase"] = phase
+        _current_progress["value"] = value
+        self.phase_progress.emit(phase, value)
+
+    def run(self) -> None:
+        _current_progress.update(phase="", value=0.0, running=True, error="")
+        try:
+            ok = load_model_with_progress(progress_cb=self._on_progress)
+            if ok:
+                _current_progress["running"] = False
+                self.finished_ok.emit()
+            else:
+                _current_progress.update(running=False, error="Modell konnte nicht geladen werden")
+                self.finished_err.emit("Modell konnte nicht geladen werden")
+        except Exception as exc:
+            logger.error("ModelLoadWorker fehlgeschlagen", exc_info=True)
+            _current_progress.update(running=False, error=str(exc))
+            self.finished_err.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
@@ -706,18 +752,28 @@ class AnonymizeWorker(QThread):
             self.progress.emit(1)
 
             try:
-                from ai_engine import _load_model, is_model_loaded, wait_for_preload
+                from ai_engine import is_model_loaded, wait_for_preload
                 if is_model_loaded():
                     self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) bereit")
                 else:
-                    self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) wird in den Speicher geladen …")
+                    # Wait for any ongoing background preload first
                     wait_for_preload(timeout=120.0)
-                model = _load_model()
-                if model is None:
-                    logger.warning("Modell konnte nicht geladen werden, "
-                                   "verwende Regex-Fallback")
-                    self.status.emit("KI-Modell nicht verfügbar – verwende einfache Erkennung …")
-                    use_regex_fallback = True
+
+                    if not is_model_loaded():
+                        # Load with phase-aware progress reporting
+                        _phase_labels = ModelLoadWorker._PHASE_LABELS
+
+                        def _on_phase(phase: str, value: float) -> None:
+                            label = _phase_labels.get(phase, phase)
+                            pct = int(value * 100)
+                            self.status.emit(f"{label} ({pct} %)")
+
+                        ok = load_model_with_progress(progress_cb=_on_phase)
+                        if not ok:
+                            logger.warning("Modell konnte nicht geladen werden, "
+                                           "verwende Regex-Fallback")
+                            self.status.emit("KI-Modell nicht verfügbar – verwende einfache Erkennung …")
+                            use_regex_fallback = True
             except Exception:
                 logger.error("Modell-Laden fehlgeschlagen", exc_info=True)
                 self.status.emit("KI-Modell nicht verfügbar – verwende einfache Erkennung …")

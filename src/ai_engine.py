@@ -512,42 +512,97 @@ def _safe_backend_init():
         pass  # internal API changed – the constructor will try itself
 
 
-def _optimal_threads() -> int:
-    """Return number of threads to use for inference (physical cores)."""
-    n = os.cpu_count() or 4
-    # Rough heuristic: use physical cores (half of logical on HT systems).
-    # But at least 2, at most 16 to avoid diminishing returns.
-    phys = max(2, min(16, n // 2 or n))
-    return phys
+def _optimal_threads() -> tuple:
+    """Return (gen_threads, batch_threads) for inference.
+
+    gen_threads: physical cores (hyperthreading hurts generation).
+    batch_threads: all logical cores (prompt eval benefits from HT).
+    """
+    logical = os.cpu_count() or 4
+    physical = max(2, min(16, logical // 2 or logical))
+    batch = max(physical, min(32, logical))
+    return physical, batch
 
 
-def _warm_page_cache(path: Path) -> None:
-    """Read the entire file sequentially to pull it into the OS page cache.
+def _pages_resident_ratio(path: Path) -> float:
+    """Return fraction of file pages already in OS page cache (Linux only).
 
-    This is much faster than mlock because:
-    - It uses large sequential reads (the OS prefetcher helps)
-    - It runs before the Llama constructor, so by the time mmap maps
-      the file, the pages are already resident in RAM
-    - On Linux, posix_fadvise WILLNEED triggers async readahead
+    Uses mincore(2) syscall via ctypes — queries the kernel's page-cache
+    bitmap to determine which 4 KB pages are resident in RAM.
+    Returns 1.0 on non-Linux or on any error (so we skip warming there).
+    """
+    import mmap as _mmap
+    try:
+        file_size = path.stat().st_size
+        if file_size == 0:
+            return 1.0
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            mm = _mmap.mmap(fd, 0, access=_mmap.ACCESS_READ)
+            try:
+                # mincore: query which pages are in RAM.  Available on Linux.
+                import ctypes
+                import ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                n_pages = (file_size + page_size - 1) // page_size
+                vec = (ctypes.c_ubyte * n_pages)()
+                addr = ctypes.c_void_p(ctypes.addressof(
+                    ctypes.c_char.from_buffer(mm)))
+                ret = libc.mincore(addr, ctypes.c_size_t(file_size), vec)
+                if ret != 0:
+                    return 1.0  # can't determine → assume resident
+                resident = sum(1 for v in vec if v & 1)
+                return resident / n_pages
+            finally:
+                mm.close()
+        finally:
+            os.close(fd)
+    except Exception:
+        return 1.0  # non-Linux or error → assume warm, skip read
+
+
+def _warm_page_cache(path: Path, progress_cb=None) -> None:
+    """Pull the model file into the OS page cache if not already resident.
+
+    Checks residency via mincore (Linux) first.  If >=90% of pages are
+    already in RAM (e.g. second launch, or after suspend/resume), the
+    read is skipped entirely — saving ~5-10 seconds on a 6 GB file.
+
+    On cold cache, does a fast sequential read with posix_fadvise
+    SEQUENTIAL hint so the kernel prefetcher works optimally.
+    (POSIX_FADV_SEQUENTIAL tells the kernel to aggressively read-ahead,
+    which doubles throughput on rotational disks and helps SSDs too.)
+
+    *progress_cb(fraction)* is called with 0.0-1.0 during the read.
     """
     file_size = path.stat().st_size
+    ratio = _pages_resident_ratio(path)
+    logger.info("Page-Cache-Status: %.0f%% von %.1f GB resident",
+                ratio * 100, file_size / 1e9)
+
+    if ratio >= 0.9:
+        logger.info("Datei bereits im Page Cache – Warming übersprungen")
+        if progress_cb:
+            try:
+                progress_cb(1.0)
+            except Exception:
+                pass
+        return
+
     t0 = time.monotonic()
 
-    # Try posix_fadvise first (Linux) – non-blocking async readahead
+    # Hint the kernel about sequential access (Linux only)
     try:
         fd = os.open(str(path), os.O_RDONLY)
         try:
             os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
-            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_WILLNEED)
-            logger.info("posix_fadvise WILLNEED gesetzt für %.1f GB",
-                        file_size / 1e9)
         finally:
             os.close(fd)
     except (AttributeError, OSError):
-        pass  # Not Linux or fadvise unavailable
+        pass
 
-    # Sequential read in large chunks to ensure pages are resident.
-    # 4MB chunks maximize throughput on SSDs and HDDs alike.
+    # Sequential read in 4 MB chunks to pull pages into OS page cache.
     CHUNK = 4 * 1024 * 1024
     read_bytes = 0
     try:
@@ -557,6 +612,11 @@ def _warm_page_cache(path: Path) -> None:
                 if not data:
                     break
                 read_bytes += len(data)
+                if progress_cb and file_size > 0:
+                    try:
+                        progress_cb(min(read_bytes / file_size, 1.0))
+                    except Exception:
+                        pass
     except OSError as e:
         logger.warning("Page-Cache-Warming fehlgeschlagen: %s", e)
         return
@@ -567,108 +627,210 @@ def _warm_page_cache(path: Path) -> None:
                 read_bytes / 1e9, elapsed, speed)
 
 
-def _load_model():
-    """Load the GGUF model via llama-cpp-python (cached globally).
+# ---------------------------------------------------------------------------
+# ModelEngine – structured 3-phase load pipeline with progress reporting
+# ---------------------------------------------------------------------------
 
-    Returns the Llama instance, or None if loading fails.
-    Thread-safe: concurrent calls block until the first load finishes.
+
+class ModelEngine:
+    """Three-phase model loader with granular progress reporting.
+
+    Phases:
+        io     – pull GGUF file into OS page cache (mincore check, seq read)
+        init   – construct Llama() instance (GGUF parse, KV alloc, graph build)
+        warmup – single dummy inference to initialise KV cache & kernels
     """
-    global _llm
-    if _llm is not None:
-        return _llm
 
-    with _preload_lock:
-        # Double-check after acquiring lock
-        if _llm is not None:
-            return _llm
+    def __init__(self, progress_cb=None):
+        """
+        Args:
+            progress_cb: ``cb(phase: str, value: float)`` with
+                         *phase* ∈ {"io", "init", "warmup"} and
+                         *value* ∈ [0.0, 1.0].
+        """
+        self._progress_cb = progress_cb
+        self.llm = None
 
+    # -- helpers -------------------------------------------------------------
+
+    def _report(self, phase: str, value: float) -> None:
+        """Invoke progress_cb robustly – exceptions are logged and swallowed."""
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb(phase, max(0.0, min(1.0, value)))
+            except Exception:
+                logger.debug("progress_cb Fehler", exc_info=True)
+
+    # -- phases --------------------------------------------------------------
+
+    def _phase_io(self, model_path: Path) -> None:
+        """Phase *io*: warm OS page cache using mincore + sequential read."""
+        self._report("io", 0.0)
+        _warm_page_cache(model_path, progress_cb=lambda frac: self._report("io", frac))
+        self._report("io", 1.0)
+
+    def _phase_init(self, model_path: Path) -> None:
+        """Phase *init*: construct the Llama instance with all optimisations."""
+        self._report("init", 0.0)
+
+        # Disable GPU backends before import (CPU-only PyInstaller builds)
+        os.environ["GGML_CUDA"] = "0"
+        os.environ["GGML_VULKAN"] = "0"
+        os.environ["GGML_METAL"] = "0"
+
+        n_gen, n_batch_threads = _optimal_threads()
+        logger.info("Verwende %d Threads (Generation) / %d Threads (Batch)",
+                     n_gen, n_batch_threads)
+
+        _safe_backend_init()
+        from llama_cpp import Llama
+
+        # Detect GPU
+        n_gpu = 0
+        try:
+            from llama_cpp import llama_supports_gpu_offload
+            if llama_supports_gpu_offload():
+                n_gpu = -1
+                logger.info("GPU-Offload verfügbar")
+        except (ImportError, OSError, Exception):
+            logger.info("Kein GPU-Offload, verwende CPU")
+
+        # KV cache quantization: Q8_0 halves the KV memory vs f16,
+        # making the n_ctx=16384 allocation much faster and lighter.
+        kv_quant_kwargs = {}
+        try:
+            from llama_cpp import GGML_TYPE_Q8_0
+            kv_quant_kwargs = {"type_k": GGML_TYPE_Q8_0,
+                               "type_v": GGML_TYPE_Q8_0}
+            logger.info("KV-Cache-Quantisierung: Q8_0")
+        except ImportError:
+            logger.info("KV-Cache-Quantisierung nicht verfügbar")
+
+        # n_batch=1024: 2x default, ~30% faster prompt eval
+        # Thread-Split: physical cores for gen, all logical for batch
+        # KV Q8_0: half KV memory, enables 16k context on 8 GB RAM
+        try:
+            self.llm = Llama(
+                model_path=str(model_path),
+                n_ctx=16384,
+                n_batch=1024,
+                n_gpu_layers=n_gpu,
+                n_threads=n_gen,
+                n_threads_batch=n_batch_threads,
+                flash_attn=False,
+                verbose=False,
+                use_mmap=True,
+                use_mlock=False,
+                **kv_quant_kwargs,
+            )
+        except (OSError, Exception) as first_err:
+            # Fallback: halve context & batch, drop KV quant and GPU
+            logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
+                           "versuche n_ctx=8192 ohne KV-Quant", first_err,
+                           exc_info=True)
+            self.llm = Llama(
+                model_path=str(model_path),
+                n_ctx=8192,
+                n_batch=512,
+                n_gpu_layers=0,
+                n_threads=n_gen,
+                n_threads_batch=n_batch_threads,
+                flash_attn=False,
+                verbose=False,
+                use_mmap=True,
+                use_mlock=False,
+            )
+
+        self._report("init", 1.0)
+
+    def _phase_warmup(self) -> None:
+        """Phase *warmup*: dummy inference to prime KV cache & kernels.
+
+        Errors here are non-fatal – the model is usable without warm-up.
+        """
+        self._report("warmup", 0.0)
+        try:
+            self.llm.create_chat_completion(
+                messages=[{"role": "user", "content": "warmup"}],
+                max_tokens=1,
+                temperature=0.01,  # llama.cpp needs > 0
+            )
+            logger.info("Warmup-Inference abgeschlossen")
+        except Exception:
+            logger.warning("Warmup-Inference fehlgeschlagen (nicht kritisch)",
+                           exc_info=True)
+        self._report("warmup", 1.0)
+
+    # -- public entry point --------------------------------------------------
+
+    def load(self) -> bool:
+        """Run the full 3-phase pipeline: io → init → warmup.
+
+        Returns True if the model is ready for inference.
+        """
         model_path = _resolve_model_path()
         if model_path is None:
             logger.error("Modell-Datei nicht gefunden: %s", _GGUF_PATH)
-            return None
+            return False
 
         # Validate GGUF magic bytes
         try:
             with open(model_path, "rb") as f:
                 magic = f.read(4)
             if magic != b"GGUF":
-                logger.error("Ungültige GGUF-Datei (magic: %r). Datei evtl. korrupt.", magic)
-                return None
+                logger.error("Ungültige GGUF-Datei (magic: %r)", magic)
+                return False
         except OSError as e:
             logger.error("Modell-Datei nicht lesbar: %s", e)
-            return None
+            return False
 
         t0 = time.monotonic()
-        logger.info("Lade Modell: %s", model_path)
-
-        # Phase 1: Pull entire file into OS page cache BEFORE llama.cpp
-        # touches it. This makes the subsequent mmap near-instant because
-        # all pages are already resident.
-        _warm_page_cache(model_path)
-
-        # Force-disable GPU backends via environment BEFORE importing llama_cpp
-        # so that llama.cpp's internal backend init never touches GPU drivers.
-        os.environ["GGML_CUDA"] = "0"
-        os.environ["GGML_VULKAN"] = "0"
-        os.environ["GGML_METAL"] = "0"
-
-        n_threads = _optimal_threads()
-        logger.info("Verwende %d Threads für Inferenz", n_threads)
+        logger.info("Lade Modell (3-Phasen-Pipeline): %s", model_path)
 
         try:
-            # Safe backend init: catches access violations from GPU probing
-            _safe_backend_init()
-
-            from llama_cpp import Llama
-
-            # Detect GPU
-            n_gpu = 0
-            try:
-                from llama_cpp import llama_supports_gpu_offload
-                if llama_supports_gpu_offload():
-                    n_gpu = -1
-                    logger.info("GPU-Offload verfügbar")
-            except (ImportError, OSError, Exception):
-                logger.info("Kein GPU-Offload, verwende CPU")
-
-            # Phase 2: Load model. use_mlock=False because page cache warming
-            # already made all pages resident; mlock would just slow things
-            # down by forcing synchronous page faults.
-            try:
-                _llm = Llama(
-                    model_path=str(model_path),
-                    n_ctx=16384,
-                    n_gpu_layers=n_gpu,
-                    n_threads=n_threads,
-                    n_threads_batch=n_threads,
-                    flash_attn=True,
-                    verbose=False,
-                    use_mmap=True,
-                    use_mlock=False,
-                )
-            except (OSError, Exception) as first_err:
-                logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
-                               "versuche n_ctx=8192", first_err, exc_info=True)
-                _llm = Llama(
-                    model_path=str(model_path),
-                    n_ctx=8192,
-                    n_gpu_layers=0,
-                    n_threads=n_threads,
-                    n_threads_batch=n_threads,
-                    flash_attn=False,
-                    verbose=False,
-                    use_mmap=True,
-                    use_mlock=False,
-                )
-
-            elapsed = time.monotonic() - t0
-            logger.info("Modell geladen in %.1f Sekunden", elapsed)
-            return _llm
-
+            self._phase_io(model_path)
+            self._phase_init(model_path)
+            self._phase_warmup()
         except Exception:
-            logger.error("Modell konnte nicht geladen werden", exc_info=True)
-            release_model()
-            return None
+            logger.error("Modell-Laden fehlgeschlagen", exc_info=True)
+            self.llm = None
+            return False
+
+        elapsed = time.monotonic() - t0
+        logger.info("Modell geladen in %.1f Sekunden (3 Phasen)", elapsed)
+        return self.llm is not None
+
+
+def load_model_with_progress(progress_cb=None) -> bool:
+    """Load the model using the 3-phase pipeline with progress reporting.
+
+    *progress_cb(phase, value)* is called during loading.
+    Thread-safe: concurrent calls block until the first load finishes.
+    Returns True if model is ready.
+    """
+    global _llm
+    if _llm is not None:
+        return True
+
+    with _preload_lock:
+        if _llm is not None:
+            return True
+
+        engine = ModelEngine(progress_cb=progress_cb)
+        if engine.load():
+            _llm = engine.llm
+            return True
+        return False
+
+
+def _load_model():
+    """Load the GGUF model via llama-cpp-python (cached globally).
+
+    Returns the Llama instance, or None if loading fails.
+    Thread-safe: delegates to load_model_with_progress() (3-phase pipeline).
+    """
+    load_model_with_progress()
+    return _llm
 
 
 def preload_model() -> None:
