@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -108,10 +106,10 @@ jobs:
       - name: Create or update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v3.1
-          name: "PDF Anonymizer v3.1 \u2013 Qwen3.5-9B"
+          tag_name: latest
+          name: PDF Anonymizer - Lokale KI-Anonymisierung
           body: |
-            ## PDF Anonymizer \u2013 Lokale KI-Anonymisierung
+            ## PDF Anonymizer - Lokale KI-Anonymisierung
 
             **Downloads:**
             - **Windows:** `PDFAnonymizer-Windows.zip` herunterladen, entpacken und starten
@@ -121,12 +119,12 @@ jobs:
 
             ---
 
-            ### Was ist neu (v3.1)
-            - **Neues KI-Modell:** Qwen3.5-9B (GGUF Q4_K_M) \u2013 neuer, schneller, besser
-            - **Robuster Download:** Fehler beim Modell-Download behoben
-            - **Schnellere Analyse:** Thinking-Modus deaktiviert fuer schnellere Ergebnisse
-            - **Bessere Fehlerbehandlung:** Teilweise Ergebnisse bei grossen Dokumenten
-            - **Kleine EXE:** Kein torch/transformers mehr noetig, deutlich kompakter
+            ### Features
+            - **KI-Modell:** Qwen3.5-9B (GGUF Q4_K_M) - schnell und praezise
+            - **Robuster Download:** Zuverlaessiger Modell-Download
+            - **Schnelle Analyse:** Optimierte Inferenz mit mmap, KV-Cache und Preload
+            - **Fehlerbehandlung:** Teilweise Ergebnisse bei grossen Dokumenten
+            - **Kompakt:** Kein torch/transformers noetig
             - **Kein API-Key noetig:** Keine Cloud, keine laufenden Kosten
             - **Datenschutz:** Keine Daten verlassen Ihr Geraet
 
