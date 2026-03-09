@@ -522,48 +522,48 @@ def _optimal_threads() -> int:
 
 
 def _warm_page_cache(path: Path) -> None:
-    """Hint the OS to start reading the model file into the page cache.
+    """Read the entire file sequentially to pull it into the OS page cache.
 
-    Uses posix_fadvise (Linux) or fcntl F_RDADVISE (macOS) to trigger
-    asynchronous kernel readahead.  This is non-blocking and doesn't
-    allocate Python-side memory, so it's safe on low-RAM systems.
+    This makes the subsequent mmap in llama.cpp near-instant because all
+    pages are already resident.  Memory usage is minimal: only one 4 MB
+    buffer is alive at a time, and the page cache pages are shared with
+    the later mmap (same file = same physical pages, no duplication).
 
-    Falls back to a no-op on Windows or if the syscall isn't available.
+    On Linux, posix_fadvise SEQUENTIAL is set first so the kernel's
+    readahead prefetcher works optimally during the sequential read.
     """
     file_size = path.stat().st_size
-    logger.info("Page-Cache-Hint für %.1f GB Modelldatei", file_size / 1e9)
+    t0 = time.monotonic()
 
-    # Linux: posix_fadvise triggers async readahead in the kernel
+    # Hint the kernel about sequential access (Linux only)
     try:
         fd = os.open(str(path), os.O_RDONLY)
         try:
             os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_SEQUENTIAL)
-            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_WILLNEED)
-            logger.info("posix_fadvise WILLNEED gesetzt")
         finally:
             os.close(fd)
-        return
     except (AttributeError, OSError):
-        pass  # Not Linux or fadvise unavailable
-
-    # macOS: fcntl F_RDADVISE (advisory read)
-    try:
-        import fcntl
-        import struct
-        F_RDADVISE = 44  # macOS specific
-        fd = os.open(str(path), os.O_RDONLY)
-        try:
-            # struct radvisory { off_t ra_offset; int ra_count; }
-            advisory = struct.pack("qi", 0, file_size if file_size < 2**31 else 2**31 - 1)
-            fcntl.fcntl(fd, F_RDADVISE, advisory)
-            logger.info("fcntl F_RDADVISE gesetzt (macOS)")
-        finally:
-            os.close(fd)
-        return
-    except (ImportError, AttributeError, OSError):
         pass
 
-    logger.debug("Kein Page-Cache-Hint verfügbar auf dieser Plattform")
+    # Sequential read in large chunks to ensure pages are resident.
+    # 4 MB chunks maximize throughput on SSDs and HDDs alike.
+    CHUNK = 4 * 1024 * 1024
+    read_bytes = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(CHUNK)
+                if not data:
+                    break
+                read_bytes += len(data)
+    except OSError as e:
+        logger.warning("Page-Cache-Warming fehlgeschlagen: %s", e)
+        return
+
+    elapsed = time.monotonic() - t0
+    speed = (read_bytes / 1e9) / elapsed if elapsed > 0 else 0
+    logger.info("Page-Cache-Warming: %.1f GB in %.1f s (%.1f GB/s)",
+                read_bytes / 1e9, elapsed, speed)
 
 
 def _load_model():
