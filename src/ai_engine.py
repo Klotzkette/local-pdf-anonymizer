@@ -512,27 +512,74 @@ def _safe_backend_init():
         pass  # internal API changed – the constructor will try itself
 
 
-def _optimal_threads() -> int:
-    """Return number of threads to use for inference (physical cores)."""
-    n = os.cpu_count() or 4
-    # Rough heuristic: use physical cores (half of logical on HT systems).
-    # But at least 2, at most 16 to avoid diminishing returns.
-    phys = max(2, min(16, n // 2 or n))
-    return phys
+def _optimal_threads() -> tuple:
+    """Return (gen_threads, batch_threads) for inference.
+
+    gen_threads: physical cores (hyperthreading hurts generation).
+    batch_threads: all logical cores (prompt eval benefits from HT).
+    """
+    logical = os.cpu_count() or 4
+    physical = max(2, min(16, logical // 2 or logical))
+    batch = max(physical, min(32, logical))
+    return physical, batch
+
+
+def _pages_resident_ratio(path: Path) -> float:
+    """Return fraction of file pages already in OS page cache (Linux only).
+
+    Uses mmap + os.posix_fadvise to avoid loading the file.  Returns 1.0
+    on non-Linux or on any error (so we skip warming by default there).
+    """
+    import mmap as _mmap
+    try:
+        file_size = path.stat().st_size
+        if file_size == 0:
+            return 1.0
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            mm = _mmap.mmap(fd, 0, access=_mmap.ACCESS_READ)
+            try:
+                # mincore: query which pages are in RAM.  Available on Linux.
+                import ctypes
+                import ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                n_pages = (file_size + page_size - 1) // page_size
+                vec = (ctypes.c_ubyte * n_pages)()
+                addr = ctypes.c_void_p(ctypes.addressof(
+                    ctypes.c_char.from_buffer(mm)))
+                ret = libc.mincore(addr, ctypes.c_size_t(file_size), vec)
+                if ret != 0:
+                    return 1.0  # can't determine → assume resident
+                resident = sum(1 for v in vec if v & 1)
+                return resident / n_pages
+            finally:
+                mm.close()
+        finally:
+            os.close(fd)
+    except Exception:
+        return 1.0  # non-Linux or error → assume warm, skip read
 
 
 def _warm_page_cache(path: Path) -> None:
-    """Read the entire file sequentially to pull it into the OS page cache.
+    """Pull the model file into the OS page cache if not already resident.
 
-    This makes the subsequent mmap in llama.cpp near-instant because all
-    pages are already resident.  Memory usage is minimal: only one 4 MB
-    buffer is alive at a time, and the page cache pages are shared with
-    the later mmap (same file = same physical pages, no duplication).
+    Checks residency via mincore (Linux) first.  If >=90% of pages are
+    already in RAM (e.g. second launch, or after suspend/resume), the
+    read is skipped entirely — saving ~5-10 seconds on a 6 GB file.
 
-    On Linux, posix_fadvise SEQUENTIAL is set first so the kernel's
-    readahead prefetcher works optimally during the sequential read.
+    On cold cache, does a fast sequential read with posix_fadvise
+    SEQUENTIAL hint so the kernel prefetcher works optimally.
     """
     file_size = path.stat().st_size
+    ratio = _pages_resident_ratio(path)
+    logger.info("Page-Cache-Status: %.0f%% von %.1f GB resident",
+                ratio * 100, file_size / 1e9)
+
+    if ratio >= 0.9:
+        logger.info("Datei bereits im Page Cache – Warming übersprungen")
+        return
+
     t0 = time.monotonic()
 
     # Hint the kernel about sequential access (Linux only)
@@ -546,7 +593,6 @@ def _warm_page_cache(path: Path) -> None:
         pass
 
     # Sequential read in large chunks to ensure pages are resident.
-    # 4 MB chunks maximize throughput on SSDs and HDDs alike.
     CHUNK = 4 * 1024 * 1024
     read_bytes = 0
     try:
@@ -611,8 +657,9 @@ def _load_model():
         os.environ["GGML_VULKAN"] = "0"
         os.environ["GGML_METAL"] = "0"
 
-        n_threads = _optimal_threads()
-        logger.info("Verwende %d Threads für Inferenz", n_threads)
+        n_gen, n_batch_threads = _optimal_threads()
+        logger.info("Verwende %d Threads (Generation) / %d Threads (Batch)",
+                     n_gen, n_batch_threads)
 
         try:
             # Safe backend init: catches access violations from GPU probing
@@ -630,31 +677,48 @@ def _load_model():
             except (ImportError, OSError, Exception):
                 logger.info("Kein GPU-Offload, verwende CPU")
 
-            # Phase 2: Load model.  use_mlock=False + use_mmap=True lets the
-            # OS page cache handle residency (warmed by Phase 1 hint above).
-            # flash_attn stays False – it can segfault on builds without
-            # flash-attention support, and try/except cannot catch that.
+            # KV cache quantization: Q8_0 halves the KV memory vs f16,
+            # making the n_ctx=16384 allocation much faster and lighter.
+            # type_k/type_v require llama-cpp-python >= 0.2.56.
+            kv_quant_kwargs = {}
+            try:
+                from llama_cpp import GGML_TYPE_Q8_0
+                kv_quant_kwargs = {"type_k": GGML_TYPE_Q8_0,
+                                   "type_v": GGML_TYPE_Q8_0}
+                logger.info("KV-Cache-Quantisierung: Q8_0")
+            except ImportError:
+                logger.info("KV-Cache-Quantisierung nicht verfügbar")
+
+            # Phase 2: Load model.
+            # - n_batch=1024: large batch for fast prompt evaluation
+            #   (LM Studio default; llama-cpp-python default is only 512)
+            # - n_threads_batch uses all logical cores (HT helps for batches)
+            # - flash_attn=False: can segfault without compile-time support
             try:
                 _llm = Llama(
                     model_path=str(model_path),
                     n_ctx=16384,
+                    n_batch=1024,
                     n_gpu_layers=n_gpu,
-                    n_threads=n_threads,
-                    n_threads_batch=n_threads,
+                    n_threads=n_gen,
+                    n_threads_batch=n_batch_threads,
                     flash_attn=False,
                     verbose=False,
                     use_mmap=True,
                     use_mlock=False,
+                    **kv_quant_kwargs,
                 )
             except (OSError, Exception) as first_err:
                 logger.warning("Modell-Laden (Versuch 1) fehlgeschlagen: %s – "
-                               "versuche n_ctx=8192", first_err, exc_info=True)
+                               "versuche n_ctx=8192 ohne KV-Quant", first_err,
+                               exc_info=True)
                 _llm = Llama(
                     model_path=str(model_path),
                     n_ctx=8192,
+                    n_batch=512,
                     n_gpu_layers=0,
-                    n_threads=n_threads,
-                    n_threads_batch=n_threads,
+                    n_threads=n_gen,
+                    n_threads_batch=n_batch_threads,
                     flash_attn=False,
                     verbose=False,
                     use_mmap=True,
