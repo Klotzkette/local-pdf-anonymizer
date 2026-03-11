@@ -24,16 +24,8 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: PDFAnonymizer-Windows-x64.zip
-            zip_cmd: >-
-              cd dist &&
-              powershell Compress-Archive
-              -Path toms_super_simple_pdf_anonymizer
-              -DestinationPath PDFAnonymizer-Windows-x64.zip
           - os: macos-latest
             artifact_name: PDFAnonymizer-macOS-x64.zip
-            zip_cmd: >-
-              cd dist &&
-              zip -r PDFAnonymizer-macOS-x64.zip toms_super_simple_pdf_anonymizer
 
     runs-on: ${{ matrix.os }}
 
@@ -88,9 +80,19 @@ jobs:
         run: pyinstaller build.spec --noconfirm --clean
 
       # ── Package ───────────────────────────────────────────────────
-      - name: Create ZIP archive
-        run: ${{ matrix.zip_cmd }}
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+      - name: Create ZIP archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd dist
+          Compress-Archive -Path toms_super_simple_pdf_anonymizer -DestinationPath PDFAnonymizer-Windows-x64.zip
+
+      - name: Create ZIP archive (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          zip -r PDFAnonymizer-macOS-x64.zip toms_super_simple_pdf_anonymizer
 
       # ── Upload to release ─────────────────────────────────────────
       - name: Upload release asset
