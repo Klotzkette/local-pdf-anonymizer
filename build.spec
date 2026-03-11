@@ -49,6 +49,11 @@ a = Analysis(
         'nvidia.nvjitlink', 'nvidia.nvtx',
         'sympy', 'networkx',
         'tokenizers',
+        # ocrmypdf and its heavy deps are not needed in the bundle –
+        # the app imports ocrmypdf lazily (try/except ImportError) and
+        # falls back to the CLI tool at runtime.
+        'ocrmypdf', 'pikepdf', 'pi_heif',
+        'pdfminer', 'fpdf', 'pluggy',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
