@@ -67,7 +67,7 @@ jobs:
       - name: Install Python deps (macOS)
         if: runner.os == 'macOS'
         env:
-          CMAKE_ARGS: "-DGGML_METAL=on"
+          CMAKE_ARGS: "-DGGML_METAL=on -DGGML_NATIVE=off"
           FORCE_CMAKE: "1"
         run: pip install --no-cache-dir -r requirements.txt
 
