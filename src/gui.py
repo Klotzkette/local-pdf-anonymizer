@@ -69,7 +69,9 @@ try:
         is_model_downloaded, download_model,
         is_model_loaded, preload_model, wait_for_preload,
         load_model_with_progress, ModelEngine,
-        MODEL_DISPLAY_NAME,
+        get_model_display_name, get_selected_model, save_model_setting,
+        get_model_info, MODEL_VARIANTS,
+        validate_model_file, delete_model_file, get_loaded_variant,
     )
     from pdf_processor import (
         extract_text, redact_pdf, get_page_count,
@@ -84,16 +86,23 @@ except ImportError as _imp_err:
     SCOPE_NAMES_ONLY = "names_only"
     SCOPE_ALL = "all"
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".jpg", ".jpeg"}
-    MODEL_DISPLAY_NAME = "Qwen3.5-9B"
-    def is_model_downloaded(): return False
-    def download_model(progress_callback=None): pass
+    MODEL_VARIANTS = {}
+    def get_model_display_name(): return "Qwen3.5-9B"
+    def get_selected_model(): return "9B"
+    def save_model_setting(v): pass
+    def get_model_info(v=None): return {"display_name": "Qwen3.5-9B", "description": "", "download_gb": 6}
+    def is_model_downloaded(v=None): return False
+    def download_model(progress_callback=None, variant=None): pass
     def is_model_loaded(): return False
-    def preload_model(): pass
+    def get_loaded_variant(): return None
+    def preload_model(progress_cb=None): pass
     def wait_for_preload(timeout=120.0): return False
-    def load_model_with_progress(progress_cb=None): return False
+    def load_model_with_progress(progress_cb=None, variant=None): return False
+    def validate_model_file(v=None): return None
+    def delete_model_file(v=None): return False
     class ModelEngine:
         def __init__(self, progress_cb=None): pass
-        def load(self): return False
+        def load(self, variant=None): return False
 else:
     _import_error = None
 
@@ -691,6 +700,10 @@ class ModelLoadWorker(QThread):
         "warmup": "Warm-Up …",
     }
 
+    def __init__(self, variant: str = None, parent=None):
+        super().__init__(parent)
+        self._variant = variant
+
     def _on_progress(self, phase: str, value: float) -> None:
         _current_progress["phase"] = phase
         _current_progress["value"] = value
@@ -699,13 +712,22 @@ class ModelLoadWorker(QThread):
     def run(self) -> None:
         _current_progress.update(phase="", value=0.0, running=True, error="")
         try:
-            ok = load_model_with_progress(progress_cb=self._on_progress)
+            ok = load_model_with_progress(
+                progress_cb=self._on_progress,
+                variant=self._variant,
+            )
             if ok:
                 _current_progress["running"] = False
                 self.finished_ok.emit()
             else:
                 _current_progress.update(running=False, error="Modell konnte nicht geladen werden")
                 self.finished_err.emit("Modell konnte nicht geladen werden")
+        except MemoryError:
+            msg = ("Nicht genügend Arbeitsspeicher (RAM).\n"
+                   "Versuchen Sie das kleinere 3B-Modell in den Einstellungen.")
+            logger.error("ModelLoadWorker: Out of Memory", exc_info=True)
+            _current_progress.update(running=False, error=msg)
+            self.finished_err.emit(msg)
         except Exception as exc:
             logger.error("ModelLoadWorker fehlgeschlagen", exc_info=True)
             _current_progress.update(running=False, error=str(exc))
@@ -754,7 +776,7 @@ class AnonymizeWorker(QThread):
             try:
                 from ai_engine import is_model_loaded, wait_for_preload
                 if is_model_loaded():
-                    self.status.emit(f"KI-Modell ({MODEL_DISPLAY_NAME}) bereit")
+                    self.status.emit(f"KI-Modell ({get_model_display_name()}) bereit")
                 else:
                     # Wait for any ongoing background preload first
                     wait_for_preload(timeout=120.0)
@@ -933,12 +955,16 @@ class AnonymizeWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ModelDownloadWorker(QThread):
-    """Downloads Qwen3.5-9B GGUF from HuggingFace in the background."""
+    """Downloads a GGUF model from HuggingFace in the background."""
 
     progress = pyqtSignal(int)    # -1 = indeterminate, 0-100 = percentage
     status   = pyqtSignal(str)
     finished_ok  = pyqtSignal()
     finished_err = pyqtSignal(str)
+
+    def __init__(self, variant: str = None, parent=None):
+        super().__init__(parent)
+        self._variant = variant
 
     def run(self):
         try:
@@ -946,7 +972,7 @@ class ModelDownloadWorker(QThread):
                 self.progress.emit(pct)
                 self.status.emit(msg)
 
-            download_model(progress_callback=_cb)
+            download_model(progress_callback=_cb, variant=self._variant)
             self.finished_ok.emit()
         except Exception as e:
             import traceback
@@ -958,23 +984,24 @@ class ModelDownloadWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class SettingsDialog(QDialog):
-    """KI-Modell-Verwaltung: Download-Status und Download-Button."""
+    """KI-Modell-Verwaltung: Model selection, download, and status."""
 
     model_status_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("KI-Modell")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(520)
         self.setStyleSheet(STYLESHEET)
         self._download_worker: ModelDownloadWorker | None = None
+        self._load_worker: ModelLoadWorker | None = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(16)
         layout.setContentsMargins(32, 28, 32, 24)
 
         # -- Header --
-        header = QLabel(f"\u2728  KI-Modell: {MODEL_DISPLAY_NAME}")
+        header = QLabel("\u2728  KI-Modell-Einstellungen")
         header.setStyleSheet(
             f"color: {TEXT_PRIMARY}; font-size: 18px; letter-spacing: -0.3px;"
         )
@@ -990,19 +1017,58 @@ class SettingsDialog(QDialog):
 
         layout.addSpacing(4)
 
-        # -- Model info box --
-        info_box = QGroupBox("Modell-Informationen")
-        info_layout = QFormLayout(info_box)
-        info_layout.setSpacing(8)
-        info_layout.addRow(
-            "Modell:", QLabel(f"{MODEL_DISPLAY_NAME} (9B Parameter, Q4_K_M)")
+        # -- Model selection --
+        model_label = QLabel("Modell ausw\u00e4hlen")
+        model_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 11px; "
+            f"text-transform: uppercase; letter-spacing: 1px;"
         )
-        info_layout.addRow("Kontext:", QLabel("262 000 Tokens (bis 1M erweiterbar)"))
-        info_layout.addRow("Typ:", QLabel("Sprachmodell, lokal"))
-        info_layout.addRow(
-            "Speicherbedarf:", QLabel("\u223C 6 GB Download  \u00b7  \u223C 8 GB RAM")
-        )
-        layout.addWidget(info_box)
+        layout.addWidget(model_label)
+
+        self._selected_variant = get_selected_model()
+        self._model_cards: dict = {}
+
+        for variant_key, info in MODEL_VARIANTS.items():
+            card = QFrame()
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card_layout = QHBoxLayout(card)
+            card_layout.setSpacing(12)
+            card_layout.setContentsMargins(14, 10, 14, 10)
+
+            # Text info
+            text_layout = QVBoxLayout()
+            text_layout.setSpacing(2)
+
+            title = QLabel(info["display_name"])
+            title.setStyleSheet(
+                f"color: {TEXT_PRIMARY}; font-size: 13px; "
+                f"border: none; background: transparent;"
+            )
+            text_layout.addWidget(title)
+
+            desc_lbl = QLabel(info["description"])
+            desc_lbl.setStyleSheet(
+                f"color: {TEXT_MUTED}; font-size: 11px; "
+                f"border: none; background: transparent;"
+            )
+            text_layout.addWidget(desc_lbl)
+
+            card_layout.addLayout(text_layout, stretch=1)
+
+            # Status indicator on the right
+            status_lbl = QLabel()
+            status_lbl.setStyleSheet(
+                f"font-size: 11px; border: none; background: transparent;"
+            )
+            card_layout.addWidget(status_lbl)
+
+            card.mousePressEvent = lambda event, k=variant_key: self._select_variant(k)
+            self._model_cards[variant_key] = {
+                "card": card, "status": status_lbl, "title": title
+            }
+            layout.addWidget(card)
+
+        layout.addSpacing(4)
 
         # -- Status + progress --
         self._status_label = QLabel()
@@ -1035,44 +1101,124 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-        self._refresh_status()
+        self._refresh_ui()
 
     # ------------------------------------------------------------------
 
-    def _refresh_status(self):
-        if is_model_downloaded():
-            self._status_label.setText(
-                f"\u2713  {MODEL_DISPLAY_NAME} ist heruntergeladen und einsatzbereit."
-            )
-            self._status_label.setStyleSheet(
-                f"color: {SUCCESS}; font-size: 13px;"
-            )
-            self._download_btn.setVisible(False)
+    def _select_variant(self, variant: str):
+        """User clicked a model card to select it."""
+        if self._download_worker and self._download_worker.isRunning():
+            return  # don't switch during download
+        if self._load_worker and self._load_worker.isRunning():
+            return
+
+        old = self._selected_variant
+        self._selected_variant = variant
+        save_model_setting(variant)
+
+        # If switching to a different variant and old one is loaded, release it
+        if old != variant and get_loaded_variant() == old:
+            release_model()
+
+        self._refresh_ui()
+        self.model_status_changed.emit()
+
+    def _refresh_ui(self):
+        """Update all card styles and status based on current state."""
+        variant = self._selected_variant
+
+        for key, widgets in self._model_cards.items():
+            card = widgets["card"]
+            status = widgets["status"]
+            is_selected = key == variant
+            downloaded = is_model_downloaded(key)
+            loaded = get_loaded_variant() == key
+
+            # Card styling
+            border_col = ACCENT if is_selected else BORDER
+            bg_col = "#EBF4FF" if is_selected else BG_CARD
+            border_w = "2" if is_selected else "1"
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {bg_col};
+                    border: {border_w}px solid {border_col};
+                    border-radius: 12px;
+                    padding: 10px 14px;
+                }}
+                QFrame:hover {{
+                    border-color: {ACCENT};
+                    background-color: #EBF4FF;
+                }}
+            """)
+
+            # Status text
+            if loaded:
+                status.setText("\u2713 Im RAM")
+                status.setStyleSheet(
+                    f"color: {SUCCESS}; font-size: 11px; "
+                    f"border: none; background: transparent;"
+                )
+            elif downloaded:
+                status.setText("\u2713 Bereit")
+                status.setStyleSheet(
+                    f"color: {ACCENT_SOFT}; font-size: 11px; "
+                    f"border: none; background: transparent;"
+                )
+            else:
+                status.setText("Nicht geladen")
+                status.setStyleSheet(
+                    f"color: {TEXT_MUTED}; font-size: 11px; "
+                    f"border: none; background: transparent;"
+                )
+
+        # Update status label and download button
+        display_name = get_model_info(variant)["display_name"]
+        if is_model_downloaded(variant):
+            # Validate file
+            err = validate_model_file(variant)
+            if err:
+                self._status_label.setText(
+                    f"\u26A0  {display_name}: {err}\n"
+                    f"Klicken Sie \u201eModell herunterladen\u201c, um erneut herunterzuladen."
+                )
+                self._status_label.setStyleSheet(f"color: {ERROR}; font-size: 12px;")
+                self._download_btn.setVisible(True)
+                self._download_btn.setText("\u21BB  Erneut herunterladen")
+            else:
+                self._status_label.setText(
+                    f"\u2713  {display_name} ist heruntergeladen und einsatzbereit."
+                )
+                self._status_label.setStyleSheet(f"color: {SUCCESS}; font-size: 13px;")
+                self._download_btn.setVisible(False)
         else:
             self._status_label.setText(
-                f"Das Modell wurde noch nicht heruntergeladen.\n"
+                f"{display_name} wurde noch nicht heruntergeladen.\n"
                 f"Dr\u00fccken Sie \u201eModell herunterladen\u201c, um zu starten."
             )
-            self._status_label.setStyleSheet(
-                f"color: {TEXT_SECONDARY}; font-size: 12px;"
-            )
+            self._status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
             self._download_btn.setVisible(True)
+            self._download_btn.setText("\u2193  Modell herunterladen")
 
     def _start_download(self):
         if self._download_worker and self._download_worker.isRunning():
             return
+
+        variant = self._selected_variant
+        display_name = get_model_info(variant)["display_name"]
+
+        # If re-downloading a corrupted file, delete it first
+        if is_model_downloaded(variant) and validate_model_file(variant):
+            delete_model_file(variant)
 
         self._download_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
-        self._status_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 12px;"
-        )
-        self._status_label.setText(f"Starte Download von {MODEL_DISPLAY_NAME} …")
+        self._status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        self._status_label.setText(f"Starte Download von {display_name} …")
 
-        self._download_worker = ModelDownloadWorker()
+        self._download_worker = ModelDownloadWorker(variant=variant)
         self._download_worker.progress.connect(self._on_dl_progress)
         self._download_worker.status.connect(self._on_dl_status)
         self._download_worker.finished_ok.connect(self._on_dl_ok)
@@ -1082,7 +1228,6 @@ class SettingsDialog(QDialog):
 
     def _on_dl_progress(self, pct: int):
         if pct < 0:
-            # Indeterminate
             self._progress_bar.setRange(0, 0)
         else:
             self._progress_bar.setRange(0, 100)
@@ -1095,7 +1240,8 @@ class SettingsDialog(QDialog):
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(100)
         self._close_btn.setEnabled(True)
-        self._refresh_status()
+        self._download_btn.setEnabled(True)
+        self._refresh_ui()
         # Immediately start preloading the model into RAM
         preload_model()
         self.model_status_changed.emit()
@@ -1109,7 +1255,6 @@ class SettingsDialog(QDialog):
 
     def _on_close(self):
         if self._download_worker and self._download_worker.isRunning():
-            # Ask for confirmation before interrupting download
             reply = QMessageBox.question(
                 self,
                 "Download l\u00e4uft",
@@ -1453,39 +1598,87 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Bereit  \u00b7  v3.2")
         self._update_statusbar_idle()
 
-        # ── Background model preload ──
+        # ── Background model preload with progress ──
         # If model is downloaded, start loading it into RAM immediately
         # so it's ready when the user drops a file.
+        self._preload_timer = None
+        self._preload_start_time = None
         if is_model_downloaded() and not is_model_loaded():
-            preload_model()
-            # Poll until model is loaded, then update the UI
-            self._preload_timer = QTimer(self)
-            self._preload_timer.setInterval(1000)
-            self._preload_timer.timeout.connect(self._check_preload)
-            self._preload_timer.start()
+            self._start_preload()
+
+    def _start_preload(self):
+        """Start background preload with progress polling."""
+        import time as _t
+        self._preload_start_time = _t.monotonic()
+
+        def _on_preload_progress(phase: str, value: float):
+            # Store progress so the timer can read it
+            _current_progress["phase"] = phase
+            _current_progress["value"] = value
+
+        preload_model(progress_cb=_on_preload_progress)
+
+        # Poll for progress updates
+        self._preload_timer = QTimer(self)
+        self._preload_timer.setInterval(500)
+        self._preload_timer.timeout.connect(self._check_preload)
+        self._preload_timer.start()
 
     def _check_preload(self):
-        """Called by timer to update UI once background preload finishes."""
+        """Called by timer to update UI during background preload."""
         if is_model_loaded():
             self._preload_timer.stop()
+            self._preload_start_time = None
             self._update_provider_pill()
             self._update_statusbar_idle()
+            return
+
+        # Show loading progress in status bar
+        phase = _current_progress.get("phase", "")
+        value = _current_progress.get("value", 0.0)
+        phase_labels = ModelLoadWorker._PHASE_LABELS
+        display_name = get_model_display_name()
+
+        if phase:
+            label = phase_labels.get(phase, phase)
+            pct = int(value * 100)
+            self.statusBar().showMessage(
+                f"{display_name}: {label} ({pct} %)  \u00b7  v3.2"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"{display_name} wird geladen \u2026  \u00b7  v3.2"
+            )
+
+        # Timeout check – if loading takes too long, warn the user
+        if self._preload_start_time:
+            import time as _t
+            from ai_engine import MODEL_LOAD_TIMEOUT
+            elapsed = _t.monotonic() - self._preload_start_time
+            if elapsed > MODEL_LOAD_TIMEOUT:
+                self._preload_timer.stop()
+                self._preload_start_time = None
+                logger.warning("Preload-Timeout nach %.0f Sekunden", elapsed)
+                self.statusBar().showMessage(
+                    f"Modell-Laden abgebrochen (Timeout nach {int(elapsed)} s)  \u00b7  v3.2"
+                )
 
     # -- Helpers --
 
     def _update_provider_pill(self):
+        display_name = get_model_display_name()
         if is_model_loaded():
-            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Bereit")
+            self.provider_pill.setText(f"{display_name}  \u00b7  Bereit")
             self.provider_pill.setStyleSheet(
                 f"color: {SUCCESS}; background-color: {SUCCESS_BG}; "
                 f"border: 1px solid {SUCCESS_BORDER}; "
                 f"border-radius: 14px; padding: 4px 12px; font-size: 11px;"
             )
         elif is_model_downloaded():
-            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  Wird geladen \u2026")
+            self.provider_pill.setText(f"{display_name}  \u00b7  Wird geladen \u2026")
             self.provider_pill.setStyleSheet("")  # default stylesheet
         else:
-            self.provider_pill.setText(f"{MODEL_DISPLAY_NAME}  \u00b7  nicht geladen")
+            self.provider_pill.setText(f"{display_name}  \u00b7  nicht geladen")
             self.provider_pill.setStyleSheet(
                 f"color: {ERROR}; background-color: {ERROR_BG}; "
                 f"border: 1px solid {ERROR_BORDER}; "
@@ -1493,13 +1686,14 @@ class MainWindow(QMainWindow):
             )
 
     def _update_statusbar_idle(self):
+        display_name = get_model_display_name()
         if is_model_loaded():
             self.statusBar().showMessage(
-                f"Bereit  \u00b7  {MODEL_DISPLAY_NAME} im RAM  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.2"
+                f"Bereit  \u00b7  {display_name} im RAM  \u00b7  PDF ablegen oder ausw\u00e4hlen  \u00b7  v3.2"
             )
         elif is_model_downloaded():
             self.statusBar().showMessage(
-                f"Modell wird geladen \u2026  \u00b7  {MODEL_DISPLAY_NAME}  \u00b7  v3.2"
+                f"Modell wird geladen \u2026  \u00b7  {display_name}  \u00b7  v3.2"
             )
         else:
             self.statusBar().showMessage(
@@ -1540,6 +1734,10 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self._update_provider_pill()
         self._update_statusbar_idle()
+        # If model was switched and the new one is downloaded but not loaded,
+        # start preloading it
+        if is_model_downloaded() and not is_model_loaded():
+            self._start_preload()
 
     def browse_pdf(self):
         if self.worker and self.worker.isRunning():
@@ -1585,10 +1783,11 @@ class MainWindow(QMainWindow):
 
         # Check that the model has been downloaded
         if not is_model_downloaded():
+            display_name = get_model_display_name()
             reply = QMessageBox.question(
                 self,
                 "KI-Modell nicht geladen",
-                f"Das KI-Modell ({MODEL_DISPLAY_NAME}) wurde noch nicht\n"
+                f"Das KI-Modell ({display_name}) wurde noch nicht\n"
                 f"heruntergeladen.\n\nJetzt herunterladen?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,

@@ -326,66 +326,219 @@ def _parse_ai_response(response_text: str) -> List[Dict[str, str]]:
 # Local Qwen3.5-9B GGUF model – download, load, inference
 # ---------------------------------------------------------------------------
 
-GGUF_REPO = "unsloth/Qwen3.5-9B-GGUF"
-GGUF_FILENAME = "Qwen3.5-9B-Q4_K_M.gguf"
-MODEL_DISPLAY_NAME = "Qwen3.5-9B (Q4_K_M)"
+# ---------------------------------------------------------------------------
+# Model variants – user can choose between 9B (accurate) and 3B (fast/light)
+# ---------------------------------------------------------------------------
 
-# Where we store the downloaded GGUF file
+MODEL_VARIANTS = {
+    "9B": {
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+        "display_name": "Qwen3.5-9B (Q4_K_M)",
+        "description": "Höhere Genauigkeit, ~6 GB Download, ~8 GB RAM",
+        "min_ram_gb": 12,
+        "download_gb": 6,
+    },
+    "3B": {
+        "repo": "unsloth/Qwen3.5-3B-GGUF",
+        "filename": "Qwen3.5-3B-Q4_K_M.gguf",
+        "display_name": "Qwen3.5-3B (Q4_K_M)",
+        "description": "Schneller, ~2 GB Download, ~4 GB RAM",
+        "min_ram_gb": 6,
+        "download_gb": 2,
+    },
+}
+
+# Where we store the downloaded GGUF files
 _MODEL_DIR = Path.home() / ".cache" / "pdf_anonymizer" / "models"
-_GGUF_PATH = _MODEL_DIR / GGUF_FILENAME
+_SETTINGS_FILE = _MODEL_DIR / "model_settings.json"
+
+# Timeout for model loading (seconds) – prevents infinite hang
+MODEL_LOAD_TIMEOUT = 300  # 5 minutes
+
+
+def _get_system_ram_gb() -> float:
+    """Return total system RAM in GB."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            c_ulonglong = ctypes.c_ulonglong
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", c_ulonglong),
+                    ("ullAvailPhys", c_ulonglong),
+                    ("ullTotalPageFile", c_ulonglong),
+                    ("ullAvailPageFile", c_ulonglong),
+                    ("ullTotalVirtual", c_ulonglong),
+                    ("ullAvailVirtual", c_ulonglong),
+                    ("ullAvailExtendedVirtual", c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullTotalPhys / (1024 ** 3)
+        else:
+            mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            return mem_bytes / (1024 ** 3)
+    except Exception:
+        logger.warning("RAM-Erkennung fehlgeschlagen", exc_info=True)
+        return 32.0  # assume plenty on failure
+
+
+def _load_model_setting() -> str:
+    """Load the selected model variant from settings. Auto-selects based on RAM."""
+    try:
+        if _SETTINGS_FILE.is_file():
+            data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+            variant = data.get("selected_model", "")
+            if variant in MODEL_VARIANTS:
+                return variant
+    except Exception:
+        logger.warning("Modell-Einstellung konnte nicht gelesen werden", exc_info=True)
+
+    # Auto-select based on available RAM
+    ram_gb = _get_system_ram_gb()
+    if ram_gb < 16:
+        logger.info("RAM: %.1f GB – wähle kleineres 3B-Modell automatisch", ram_gb)
+        return "3B"
+    logger.info("RAM: %.1f GB – wähle 9B-Modell", ram_gb)
+    return "9B"
+
+
+def save_model_setting(variant: str) -> None:
+    """Save the selected model variant to settings."""
+    if variant not in MODEL_VARIANTS:
+        return
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    _SETTINGS_FILE.write_text(
+        json.dumps({"selected_model": variant}, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("Modell-Einstellung gespeichert: %s", variant)
+
+
+def get_selected_model() -> str:
+    """Return the currently selected model variant key ('9B' or '3B')."""
+    return _load_model_setting()
+
+
+def get_model_info(variant: Optional[str] = None) -> dict:
+    """Return info dict for the given (or currently selected) model variant."""
+    if variant is None:
+        variant = get_selected_model()
+    return MODEL_VARIANTS.get(variant, MODEL_VARIANTS["9B"])
+
+
+# Dynamic accessors for the active model (backwards-compatible)
+def _active_repo() -> str:
+    return get_model_info()["repo"]
+
+
+def _active_filename() -> str:
+    return get_model_info()["filename"]
+
+
+def _active_gguf_path() -> Path:
+    return _MODEL_DIR / _active_filename()
+
+
+def get_model_display_name() -> str:
+    """Return the display name of the currently selected model."""
+    return get_model_info()["display_name"]
+
+
+# Backwards-compatible constant (used by gui.py imports)
+MODEL_DISPLAY_NAME = get_model_info()["display_name"]
 
 # Module-level model cache (loaded once, reused for every call)
 _llm = None
+_loaded_variant: Optional[str] = None  # tracks which variant is loaded
 _preload_thread: Optional[threading.Thread] = None
 _preload_lock = threading.Lock()
 
 
-def _resolve_model_path() -> Optional[Path]:
+def _resolve_model_path(variant: Optional[str] = None) -> Optional[Path]:
     """Return the actual path to the GGUF file, checking symlink target too."""
-    if _GGUF_PATH.is_file() and _GGUF_PATH.stat().st_size > 1_000_000:
-        return _GGUF_PATH
+    if variant is None:
+        variant = get_selected_model()
+    path = _MODEL_DIR / MODEL_VARIANTS[variant]["filename"]
+    if path.is_file() and path.stat().st_size > 1_000_000:
+        return path
     return None
 
 
-def is_model_downloaded() -> bool:
+def is_model_downloaded(variant: Optional[str] = None) -> bool:
     """Return True if the GGUF model file exists on disk."""
-    return _resolve_model_path() is not None
+    return _resolve_model_path(variant) is not None
 
 
-def download_model(progress_callback=None) -> None:
-    """Download Qwen3.5-9B GGUF from HuggingFace.
+def validate_model_file(variant: Optional[str] = None) -> Optional[str]:
+    """Validate the model file integrity. Returns error message or None if OK."""
+    path = _resolve_model_path(variant)
+    if path is None:
+        return "Modell-Datei nicht gefunden"
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        if magic != b"GGUF":
+            return f"Ungültige GGUF-Datei (magic: {magic!r}) – Datei möglicherweise beschädigt"
+        # Check file size is reasonable (at least 500 MB for 3B, 3 GB for 9B)
+        info = get_model_info(variant)
+        min_size = info["download_gb"] * 0.5 * 1e9  # at least 50% of expected
+        actual_size = path.stat().st_size
+        if actual_size < min_size:
+            return (f"Modell-Datei zu klein ({actual_size / 1e9:.1f} GB) – "
+                    f"erwartet ~{info['download_gb']} GB. Download möglicherweise unvollständig")
+    except OSError as e:
+        return f"Modell-Datei nicht lesbar: {e}"
+    return None
+
+
+def download_model(progress_callback=None, variant: Optional[str] = None) -> None:
+    """Download the selected GGUF model from HuggingFace.
 
     *progress_callback(pct: int, msg: str)* is called periodically.
     Pass pct=-1 for indeterminate progress.
     """
     from huggingface_hub import hf_hub_download, HfApi
 
+    if variant is None:
+        variant = get_selected_model()
+    info = get_model_info(variant)
+    repo = info["repo"]
+    filename = info["filename"]
+    gguf_path = _MODEL_DIR / filename
+    needed_gb = info["download_gb"] + 1  # buffer
+
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Check available disk space (~6 GB needed)
+    # Check available disk space
     try:
         free_bytes = shutil.disk_usage(_MODEL_DIR).free
-        if free_bytes < 7_000_000_000:
+        if free_bytes < needed_gb * 1_000_000_000:
             raise RuntimeError(
                 f"Nicht genügend Speicherplatz für das KI-Modell.\n"
-                f"Verfügbar: {free_bytes / 1e9:.1f} GB, benötigt: ~6 GB.\n"
+                f"Verfügbar: {free_bytes / 1e9:.1f} GB, benötigt: ~{info['download_gb']} GB.\n"
                 f"Bitte Speicherplatz freigeben und erneut versuchen."
             )
     except OSError:
         logger.warning("Speicherplatz konnte nicht geprüft werden")
 
     if progress_callback:
-        progress_callback(0, f"Verbinde mit HuggingFace: {GGUF_REPO} …")
+        progress_callback(0, f"Verbinde mit HuggingFace: {repo} …")
 
-    logger.info("Starte Modell-Download: %s/%s", GGUF_REPO, GGUF_FILENAME)
+    logger.info("Starte Modell-Download: %s/%s", repo, filename)
 
     # Get expected file size for progress reporting
     total_bytes = 0
     try:
         api = HfApi()
-        info = api.model_info(GGUF_REPO, files_metadata=True)
-        for f in (info.siblings or []):
-            if f.rfilename == GGUF_FILENAME:
+        repo_info = api.model_info(repo, files_metadata=True)
+        for f in (repo_info.siblings or []):
+            if f.rfilename == filename:
                 total_bytes = f.size or 0
                 break
     except Exception:
@@ -404,9 +557,9 @@ def download_model(progress_callback=None) -> None:
                         current = max(current, p.stat().st_size)
                     except OSError:
                         pass
-                if current == 0 and _GGUF_PATH.exists():
+                if current == 0 and gguf_path.exists():
                     try:
-                        current = _GGUF_PATH.stat().st_size
+                        current = gguf_path.stat().st_size
                     except OSError:
                         pass
                 if total_bytes > 0 and current > 0:
@@ -433,8 +586,8 @@ def download_model(progress_callback=None) -> None:
         # Do NOT use local_dir= as it causes 'NoneType' write errors
         # in PyInstaller environments due to symlink/file handle issues.
         cached_path = hf_hub_download(
-            repo_id=GGUF_REPO,
-            filename=GGUF_FILENAME,
+            repo_id=repo,
+            filename=filename,
         )
     finally:
         download_done.set()
@@ -444,16 +597,16 @@ def download_model(progress_callback=None) -> None:
             "Download fehlgeschlagen: HuggingFace hat keine Datei zurückgegeben."
         )
 
-    # Link from HF cache to our model directory (avoids 6 GB duplication).
+    # Link from HF cache to our model directory (avoids duplication).
     # Try symlink first (fast, saves disk), fall back to hard link, then copy.
-    if not _GGUF_PATH.is_file():
+    if not gguf_path.is_file():
         if progress_callback:
             progress_callback(96, "Verknüpfe Modell …")
         cached = Path(cached_path)
         linked = False
         for link_fn in (os.symlink, os.link):
             try:
-                link_fn(cached, _GGUF_PATH)
+                link_fn(cached, gguf_path)
                 linked = True
                 logger.info("Modell verknüpft via %s", link_fn.__name__)
                 break
@@ -462,16 +615,31 @@ def download_model(progress_callback=None) -> None:
         if not linked:
             if progress_callback:
                 progress_callback(96, "Kopiere Modell …")
-            shutil.copy2(cached_path, _GGUF_PATH)
+            shutil.copy2(cached_path, gguf_path)
 
-    logger.info("Modell-Download abgeschlossen: %s", _GGUF_PATH)
+    logger.info("Modell-Download abgeschlossen: %s", gguf_path)
     if progress_callback:
         progress_callback(100, "Download abgeschlossen")
 
 
+def delete_model_file(variant: Optional[str] = None) -> bool:
+    """Delete the model file from disk. Returns True if deleted."""
+    if variant is None:
+        variant = get_selected_model()
+    path = _MODEL_DIR / MODEL_VARIANTS[variant]["filename"]
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            logger.info("Modell-Datei gelöscht: %s", path)
+            return True
+    except OSError as e:
+        logger.error("Modell-Datei konnte nicht gelöscht werden: %s", e)
+    return False
+
+
 def release_model() -> None:
     """Free the loaded LLM from memory."""
-    global _llm
+    global _llm, _loaded_variant
     if _llm is not None:
         logger.info("Modell wird aus dem Speicher freigegeben")
         try:
@@ -479,6 +647,7 @@ def release_model() -> None:
         except Exception:
             pass
         _llm = None
+        _loaded_variant = None
 
 
 def _safe_backend_init():
@@ -650,6 +819,7 @@ class ModelEngine:
         """
         self._progress_cb = progress_cb
         self.llm = None
+        self._error_message = ""
 
     # -- helpers -------------------------------------------------------------
 
@@ -763,25 +933,26 @@ class ModelEngine:
 
     # -- public entry point --------------------------------------------------
 
-    def load(self) -> bool:
+    def load(self, variant: Optional[str] = None) -> bool:
         """Run the full 3-phase pipeline: io → init → warmup.
 
         Returns True if the model is ready for inference.
         """
-        model_path = _resolve_model_path()
+        if variant is None:
+            variant = get_selected_model()
+        self.variant = variant
+
+        model_path = _resolve_model_path(variant)
         if model_path is None:
-            logger.error("Modell-Datei nicht gefunden: %s", _GGUF_PATH)
+            logger.error("Modell-Datei nicht gefunden: %s",
+                         _MODEL_DIR / MODEL_VARIANTS[variant]["filename"])
             return False
 
-        # Validate GGUF magic bytes
-        try:
-            with open(model_path, "rb") as f:
-                magic = f.read(4)
-            if magic != b"GGUF":
-                logger.error("Ungültige GGUF-Datei (magic: %r)", magic)
-                return False
-        except OSError as e:
-            logger.error("Modell-Datei nicht lesbar: %s", e)
+        # Validate model file integrity before loading
+        validation_err = validate_model_file(variant)
+        if validation_err:
+            logger.error("Modell-Validierung fehlgeschlagen: %s", validation_err)
+            self._error_message = validation_err
             return False
 
         t0 = time.monotonic()
@@ -791,6 +962,14 @@ class ModelEngine:
             self._phase_io(model_path)
             self._phase_init(model_path)
             self._phase_warmup()
+        except MemoryError:
+            logger.error("Nicht genügend RAM zum Laden des Modells", exc_info=True)
+            self.llm = None
+            self._error_message = (
+                "Nicht genügend Arbeitsspeicher (RAM) für dieses Modell.\n"
+                "Versuchen Sie das kleinere 3B-Modell in den Einstellungen."
+            )
+            return False
         except Exception:
             logger.error("Modell-Laden fehlgeschlagen", exc_info=True)
             self.llm = None
@@ -801,26 +980,43 @@ class ModelEngine:
         return self.llm is not None
 
 
-def load_model_with_progress(progress_cb=None) -> bool:
+def load_model_with_progress(progress_cb=None, variant: Optional[str] = None) -> bool:
     """Load the model using the 3-phase pipeline with progress reporting.
 
     *progress_cb(phase, value)* is called during loading.
     Thread-safe: concurrent calls block until the first load finishes.
     Returns True if model is ready.
     """
-    global _llm
+    global _llm, _loaded_variant
+
+    if variant is None:
+        variant = get_selected_model()
+
+    # If a different variant is requested, release the current one
+    if _llm is not None and _loaded_variant != variant:
+        logger.info("Modell-Wechsel: %s → %s", _loaded_variant, variant)
+        release_model()
+
     if _llm is not None:
         return True
 
     with _preload_lock:
-        if _llm is not None:
+        if _llm is not None and _loaded_variant == variant:
             return True
 
         engine = ModelEngine(progress_cb=progress_cb)
-        if engine.load():
+        engine._error_message = ""
+        if engine.load(variant=variant):
             _llm = engine.llm
+            _loaded_variant = variant
             return True
         return False
+
+
+def get_load_error() -> str:
+    """Return the last model load error message, if any."""
+    # This is a simple accessor for the engine's error state
+    return getattr(ModelEngine, '_last_error', '')
 
 
 def _load_model():
@@ -833,11 +1029,12 @@ def _load_model():
     return _llm
 
 
-def preload_model() -> None:
+def preload_model(progress_cb=None) -> None:
     """Start loading the model into RAM in a background thread.
 
     Call this at app startup so the model is ready when the user drops a file.
     Safe to call multiple times; only the first call triggers loading.
+    *progress_cb(phase, value)* is optional – emitted during 3-phase load.
     """
     global _preload_thread
     if _llm is not None:
@@ -850,7 +1047,7 @@ def preload_model() -> None:
     def _bg_load():
         t0 = time.monotonic()
         logger.info("Hintergrund-Preload gestartet")
-        _load_model()
+        load_model_with_progress(progress_cb=progress_cb)
         elapsed = time.monotonic() - t0
         if _llm is not None:
             logger.info("Hintergrund-Preload abgeschlossen in %.1f s", elapsed)
@@ -864,6 +1061,11 @@ def preload_model() -> None:
 def is_model_loaded() -> bool:
     """Return True if the model is currently loaded in RAM."""
     return _llm is not None
+
+
+def get_loaded_variant() -> Optional[str]:
+    """Return which model variant is currently loaded, or None."""
+    return _loaded_variant if _llm is not None else None
 
 
 def wait_for_preload(timeout: float = 120.0) -> bool:
