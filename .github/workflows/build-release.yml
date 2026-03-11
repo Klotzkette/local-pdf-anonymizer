@@ -1,11 +1,17 @@
 # Build and attach Windows/macOS executables to GitHub Releases.
-# Triggered when a release is published (e.g. via the GitHub UI or API).
+# Triggered when a release is published, or manually via workflow_dispatch.
 
 name: Release Build
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach builds to (e.g. v2.0.1)'
+        required: true
+        type: string
 
 permissions:
   contents: write # needed to upload release assets
@@ -31,6 +37,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,7 +59,6 @@ jobs:
         run: |
           Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
           refreshenv
-          # Explicitly add Ghostscript and Tesseract to PATH for subsequent steps
           $gsPath = (Get-ChildItem "C:\Program Files\gs" -Recurse -Filter "gswin64c.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
           if ($gsPath) { echo "$gsPath" >> $env:GITHUB_PATH }
           $tessPath = "C:\Program Files\Tesseract-OCR"
@@ -64,7 +72,6 @@ jobs:
           cache: pip
 
       # ── Python dependencies ───────────────────────────────────────
-      # macOS: build llama-cpp-python with Metal (GPU) support
       - name: Install Python deps (macOS)
         if: runner.os == 'macOS'
         env:
@@ -72,7 +79,6 @@ jobs:
           FORCE_CMAKE: "1"
         run: pip install --no-cache-dir -r requirements.txt
 
-      # Windows: default CPU build
       - name: Install Python deps (Windows)
         if: runner.os == 'Windows'
         run: pip install -r requirements.txt
@@ -91,6 +97,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >
-          gh release upload "${{ github.event.release.tag_name }}"
+          gh release upload "${{ env.RELEASE_TAG }}"
           "dist/${{ matrix.artifact_name }}"
           --clobber
