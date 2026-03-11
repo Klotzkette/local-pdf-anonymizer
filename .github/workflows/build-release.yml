@@ -44,6 +44,18 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install tesseract ghostscript -y
 
+      - name: Refresh PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+          refreshenv
+          # Explicitly add Ghostscript and Tesseract to PATH for subsequent steps
+          $gsPath = (Get-ChildItem "C:\Program Files\gs" -Recurse -Filter "gswin64c.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          if ($gsPath) { echo "$gsPath" >> $env:GITHUB_PATH }
+          $tessPath = "C:\Program Files\Tesseract-OCR"
+          if (Test-Path $tessPath) { echo "$tessPath" >> $env:GITHUB_PATH }
+
       # ── Python ────────────────────────────────────────────────────
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
