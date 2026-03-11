@@ -1,0 +1,84 @@
+# Build and attach Windows/macOS executables to GitHub Releases.
+# Triggered when a release is published (e.g. via the GitHub UI or API).
+
+name: Release Build
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # needed to upload release assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: PDFAnonymizer-Windows-x64.zip
+            zip_cmd: >-
+              cd dist &&
+              powershell Compress-Archive
+              -Path toms_super_simple_pdf_anonymizer
+              -DestinationPath PDFAnonymizer-Windows-x64.zip
+          - os: macos-latest
+            artifact_name: PDFAnonymizer-macOS-x64.zip
+            zip_cmd: >-
+              cd dist &&
+              zip -r PDFAnonymizer-macOS-x64.zip toms_super_simple_pdf_anonymizer
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── System dependencies for ocrmypdf ──────────────────────────
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tesseract ghostscript cmake
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        run: choco install tesseract ghostscript -y
+
+      # ── Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── Python dependencies ───────────────────────────────────────
+      # macOS: build llama-cpp-python with Metal (GPU) support
+      - name: Install Python deps (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CMAKE_ARGS: "-DGGML_METAL=on"
+          FORCE_CMAKE: "1"
+        run: pip install --no-cache-dir -r requirements.txt
+
+      # Windows: default CPU build
+      - name: Install Python deps (Windows)
+        if: runner.os == 'Windows'
+        run: pip install -r requirements.txt
+
+      # ── Build ─────────────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec --noconfirm --clean
+
+      # ── Package ───────────────────────────────────────────────────
+      - name: Create ZIP archive
+        run: ${{ matrix.zip_cmd }}
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+
+      # ── Upload to release ─────────────────────────────────────────
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release upload "${{ github.event.release.tag_name }}"
+          "dist/${{ matrix.artifact_name }}"
+          --clobber
