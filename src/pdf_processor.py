@@ -20,7 +20,8 @@ Key features:
 - Automatic OCR for image-based inputs and PDFs without text layer.
 """
 
-import fitz  # PyMuPDF
+from __future__ import annotations  # defer type annotation evaluation (enables lazy fitz import)
+
 from typing import Dict, Tuple, List, Optional, Callable
 import logging
 import os
@@ -29,6 +30,25 @@ import re as _re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _lazy_import_fitz():
+    """Lazy-load PyMuPDF. Called once before first PDF operation."""
+    global fitz
+    import fitz as _fitz_mod
+    fitz = _fitz_mod
+    return fitz
+
+
+# Deferred — will be replaced by actual module on first call to any PDF function.
+fitz = None  # type: ignore[assignment]
+
+
+def _ensure_fitz():
+    """Ensure PyMuPDF is loaded. No-op after first call."""
+    if fitz is None:
+        _lazy_import_fitz()
 
 logger = logging.getLogger("pdf_anonymizer")
 
@@ -56,6 +76,7 @@ _GENERIC_SUFFIXES = {
 
 def _has_text_layer(pdf_path: str) -> bool:
     """Check if a PDF has an extractable text layer."""
+    _ensure_fitz()
     try:
         doc = fitz.open(pdf_path)
         try:
@@ -77,6 +98,7 @@ def _image_to_pdf(img_path: str) -> str:
 
     Returns the path to a temporary PDF file.
     """
+    _ensure_fitz()
     tmp_path = None
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
@@ -174,6 +196,7 @@ def _ocr_pdf(pdf_path: str) -> str:
 
 def _text_to_pdf(full_text: str) -> str:
     """Create a multi-page PDF from plain text. Returns temp file path."""
+    _ensure_fitz()
     pdf_doc = fitz.open()
     page_w, page_h = 595.28, 841.89
     margin = 50
@@ -437,7 +460,11 @@ def _page_is_scan(page) -> bool:
 
 
 def extract_text(pdf_path: str) -> str:
-    """Extract the full plain text from a PDF. Requires the PDF to have embedded text."""
+    """Extract the full plain text from a PDF. Requires the PDF to have embedded text.
+
+    Uses parallel extraction for PDFs with many pages (>4) for faster processing.
+    """
+    _ensure_fitz()
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
@@ -446,18 +473,36 @@ def extract_text(pdf_path: str) -> str:
             f"Das PDF konnte nicht geöffnet werden: {e}\n"
             "Die Datei ist möglicherweise beschädigt oder kein gültiges PDF."
         )
-    pages_text: List[str] = []
+
+    total_pages = len(doc)
+    pages_text: List[str] = [""] * total_pages
+
+    def _extract_page(page_idx: int) -> tuple:
+        """Extract text from a single page (thread-safe with fitz)."""
+        try:
+            page = doc.load_page(page_idx)
+            text = page.get_text("text")
+            text = text.replace("\x00", "")
+            return page_idx, text
+        except Exception:
+            logger.warning("Text-Extraktion fehlgeschlagen auf Seite %d", page_idx + 1,
+                           exc_info=True)
+            return page_idx, ""
+
     try:
-        for i, page in enumerate(doc):
-            try:
-                text = page.get_text("text")
-                # Replace invalid characters that could cause issues downstream
-                text = text.replace("\x00", "")
-                pages_text.append(text)
-            except Exception:
-                logger.warning("Text-Extraktion fehlgeschlagen auf Seite %d", i + 1,
-                               exc_info=True)
-                pages_text.append("")  # skip broken page, continue with rest
+        if total_pages <= 4:
+            # Sequential for small PDFs (thread overhead not worth it)
+            for i in range(total_pages):
+                _, text = _extract_page(i)
+                pages_text[i] = text
+        else:
+            # Parallel extraction for larger PDFs
+            max_workers = min(total_pages, os.cpu_count() or 4, 8)
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_extract_page, i): i for i in range(total_pages)}
+                for future in as_completed(futures):
+                    idx, text = future.result()
+                    pages_text[idx] = text
     finally:
         doc.close()
 
@@ -467,7 +512,7 @@ def extract_text(pdf_path: str) -> str:
             "Das PDF enthält keinen erkennbaren Text. "
             "Bitte stellen Sie sicher, dass das PDF Texterkennung (OCR) hat."
         )
-    logger.info("Text extrahiert: %d Zeichen aus %d Seiten", len(full), len(pages_text))
+    logger.info("Text extrahiert: %d Zeichen aus %d Seiten", len(full), total_pages)
     return full
 
 
@@ -1387,6 +1432,7 @@ def redact_pdf(
 
     Returns the output path.
     """
+    _ensure_fitz()
     # Validate output path before doing expensive work
     out_dir = os.path.dirname(output_path) or "."
     if not os.path.isdir(out_dir):
@@ -1537,6 +1583,7 @@ def _redact_page(page, sorted_entities: List[str],
 
 def get_page_count(pdf_path: str) -> int:
     """Return the number of pages in a PDF."""
+    _ensure_fitz()
     try:
         doc = fitz.open(pdf_path)
         count = len(doc)
